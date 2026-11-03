@@ -299,34 +299,45 @@ test('listener: the give-up notice is recorded as its own event', async () => {
   assert.equal(giveUp.reason, 'max-nudges-reached');
 });
 
-test('listener: a long productive turn is not cut off by the attempt ceiling', async () => {
-  // Eight productive pushes, then another undeclared reply. With the old ceiling
-  // (maxNudges * 3 = 6) this turn would have been abandoned; progress must keep it open.
+test('listener: a productive turn is never cut off by a total-attempt limit', async () => {
+  // There is no total-attempts ceiling on purpose. A turn that keeps doing work must be
+  // re-opened as often as it stops — even far past maxNudges (2 here). The interval is
+  // set to 0 so the test does not wait 5s between pushes.
   const log = tmpLog();
   const { ctx, handlers } = makeCtx();
-  apply(ctx, { logFile: log.file, logDecisions: true, maxNudges: 2 });
-  const steers = [];
+  apply(ctx, { logFile: log.file, logDecisions: true, maxNudges: 2, nudgeMinIntervalMs: 0 });
+
+  // Every push so far was followed by tool work, so the unproductive streak is 0.
   const events = [turnStart(1), userMessage(2, 'user')];
   let seq = 3;
-  for (let i = 0; i < 8; i += 1) {
+  for (let i = 0; i < 25; i += 1) {
     events.push(userMessage(seq++, SOURCE_KIND));
     events.push(toolCall(1, seq++));
   }
   events.push(finalMessage(1, seq, '现在检查这两点。'));
-  const agent = makeAgent(makeSession(events), { steers });
-  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
-  assert.equal(pushesOf(steers).length, 1, 'still pushing after eight productive pushes');
 
-  // The ceiling is configurable and still stops a genuine runaway.
-  const capped = tmpLog();
-  const second = makeCtx();
-  apply(second.ctx, { logFile: capped.file, logDecisions: true, maxNudges: 2, maxAttemptsPerTurn: 1 });
-  const cappedSteers = [];
-  const cappedAgent = makeAgent(windowSession({ text: '现在检查这两点。' }), { steers: cappedSteers });
-  await fire(second.handlers, 'agent/turn-stopping', { agent: cappedAgent, turn: 1, signal: { aborted: false } });
-  assert.equal(pushesOf(cappedSteers).length, 1);
-  await fire(second.handlers, 'agent/turn-stopping', { agent: cappedAgent, turn: 1, signal: { aborted: false } });
-  assert.equal(pushesOf(cappedSteers).length, 1, 'the configured ceiling stops further attempts');
+  const steers = [];
+  let session = makeSession(events);
+  // Rebuild the session each round with one more push, mimicking repeated re-opens.
+  for (let round = 1; round <= 12; round += 1) {
+    const agent = makeAgent(session, { steers });
+    await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+    assert.equal(
+      pushesOf(steers).length,
+      round,
+      `round ${round}: a turn that keeps working must keep being re-opened`,
+    );
+    // the model answers the push with more work, so the next stop has work after it too
+    const grown = events.concat([
+      userMessage(seq++, SOURCE_KIND),
+      toolCall(1, seq++),
+      finalMessage(1, seq++, '现在检查这两点。'),
+    ]);
+    session = makeSession(grown);
+  }
+  assert.equal(pushesOf(steers).length, 12, 'no total ceiling short of 12 productive pushes');
+  const last = readLines(log.file).filter((line) => line.event === 'nudge').at(-1);
+  assert.equal(last.attempts, 12, 'attempts is recorded for observation only');
 });
 
 test('listener: an active goal is skipped', async () => {

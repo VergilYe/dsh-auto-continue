@@ -368,10 +368,9 @@ test('defaults: documented shape', () => {
   assert.equal(DEFAULTS.completionProtocol, true);
   assert.equal(DEFAULTS.markerStyle, 'fence-check');
   assert.equal(DEFAULTS.maxNudges, 2);
-  // The absolute net sits well above the unproductive budget on purpose: a turn that keeps
-  // doing work may be re-opened many times without being treated as a runaway.
-  assert.equal(DEFAULTS.maxAttemptsPerTurn, 20);
-  assert.ok(DEFAULTS.maxAttemptsPerTurn > DEFAULTS.maxNudges * 3);
+  // No total-attempts option exists: the unproductive streak is the only cap, so a turn
+  // that keeps producing work can be re-opened without any ceiling.
+  assert.equal(DEFAULTS.maxAttemptsPerTurn, undefined);
   assert.equal(DEFAULTS.nudgeMinIntervalMs, 5000);
   assert.equal(DEFAULTS.dryRun, false);
 });

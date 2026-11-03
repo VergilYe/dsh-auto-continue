@@ -73,8 +73,7 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `enabled` | `true` | 关掉后不注册任何监听器 |
-| `maxNudges` | `2` | **连续无效**推送上限（推完有推进的不计）；`0` 等同未安装 |
-| `maxAttemptsPerTurn` | `20` | 单 turn 推送次数的**绝对**上限，只防死循环；持续有推进的 turn 可远超 `maxNudges` |
+| `maxNudges` | `2` | **连续无效**推送上限（推完有推进的不计、并清零）；`0` 等同未安装 |
 | `nudgeMinIntervalMs` | `5000` | 两次推送的最小间隔，防止一次短暂断连就把次数烧光 |
 | `delayMs` | `0` | 额外的推送前等待，期间 abort 就放弃 |
 | `dryRun` | `false` | 只记日志不推 |
@@ -93,9 +92,9 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 ## 安全阀
 
 1. 额度只记「连续无效推送」：推完模型确实干了活（有工具调用）就不算消耗，也把之前的欠账清零；连续 `maxNudges` 次推了没反应才停。计数从会话日志的持久记录推导。
-2. 单 turn 另有 `maxAttemptsPerTurn`（默认 20）做绝对上限，只用来兜死循环——它刻意远高于 `maxNudges`，避免「一直在推进」的健康回合被安全网误杀。
+2. **没有总次数上限**：一个持续在推进的 turn 可以被无限制地重新打开（日志里的 `attempts` 只用于观测，不参与任何门限）。只有「连续无效」会累积，所以病态循环（模型反复停但什么也不干）仍会在 `maxNudges` 次后停下。
 3. 两次推送至少间隔 `nudgeMinIntervalMs`（默认 5 秒），一次瞬时断连不会连着烧掉额度。
-4. **放弃时会在对话里留一条可见提示**（`giveUpNoticeText`），说明自动续接已停止、可能是上游断连或配额问题，每个 turn 只留一次；同时写一条 `event: giveup` 日志（`reason` 区分 `max-nudges-reached` 与 `attempt-ceiling`）。
+4. **放弃时会在对话里留一条可见提示**（`giveUpNoticeText`），说明自动续接已停止、可能是上游断连或配额问题，每个 turn 只留一次；同时写一条 `event: giveup` 日志。
 5. 同 turn 同末条消息指纹只推一次。
 6. `goal.phase === 'active'` 时整个跳过（不与 goal round driver 抢）。
 7. 中途人类接管（首条 assistant 之后的人类消息）清零计数、指纹与放弃标记；**开局 prompt 不算**。

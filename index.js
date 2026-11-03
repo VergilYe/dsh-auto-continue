@@ -160,7 +160,6 @@ const SUMMARY_MAX_CHARS = 120
 export const DEFAULTS = Object.freeze({
   enabled: true,
   maxNudges: 2,
-  maxAttemptsPerTurn: 20,
   nudgeMinIntervalMs: 5_000,
   delayMs: 0,
   dryRun: false,
@@ -267,9 +266,6 @@ export function resolveConfig(raw) {
   return {
     enabled: bool(input.enabled, DEFAULTS.enabled),
     maxNudges: isCount(input.maxNudges) ? input.maxNudges : DEFAULTS.maxNudges,
-    maxAttemptsPerTurn: isCount(input.maxAttemptsPerTurn)
-      ? input.maxAttemptsPerTurn
-      : DEFAULTS.maxAttemptsPerTurn,
     nudgeMinIntervalMs: isCount(input.nudgeMinIntervalMs)
       ? input.nudgeMinIntervalMs
       : DEFAULTS.nudgeMinIntervalMs,
@@ -1178,17 +1174,17 @@ async function onTurnStopping(ctx, options, states, payload) {
     return
   }
 
-  // Budget (R2/R3): only pushes that led nowhere count against it, and a push that made
-  // the model do real work resets the streak — the durable log is the authority, so a
-  // reload or a second instance cannot talk itself out of the cap.
+  // Budget: only pushes that led nowhere count, and a push that made the model do real
+  // work resets the streak. There is deliberately NO total-attempts ceiling: a turn that
+  // keeps making progress must be re-opened as often as it stops. A model that stops
+  // without producing anything simply adds to the streak and gets cut off at maxNudges.
+  // The durable log is the authority, so a reload or a second instance cannot talk itself
+  // past the cap.
   const durableStreak = folded.unproductiveStreak ?? 0
   state.count = durableStreak
-  // Absolute guard for the pathological case where our pushed message never becomes
-  // visible in the log (then the streak would stay 0 forever). It must sit well above the
-  // unproductive budget: a turn that keeps making progress may legitimately be re-opened
-  // many times, and this net is here to stop a runaway, not to cap healthy work.
-  const attemptCeiling = options.maxAttemptsPerTurn
-  if (state.count >= options.maxNudges || state.attempts >= attemptCeiling) {
+  // `state.attempts` is kept for the log only (how many pushes this turn saw in total).
+  // It must never gate a push.
+  if (state.count >= options.maxNudges) {
     // R5: when we really give up, say so in the conversation instead of closing silently.
     if (!state.gaveUp) {
       state.gaveUp = true
@@ -1198,7 +1194,7 @@ async function onTurnStopping(ctx, options, states, payload) {
         writePluginLog(options, ctx, {
           event: 'giveup',
           turn,
-          reason: state.attempts >= attemptCeiling ? 'attempt-ceiling' : 'max-nudges-reached',
+          reason: 'max-nudges-reached',
           attempts: state.attempts,
           messageId: notice.id,
         })
@@ -1211,7 +1207,7 @@ async function onTurnStopping(ctx, options, states, payload) {
       priorNudges: state.count,
       attempts: state.attempts,
       nudge: false,
-      reason: state.attempts >= attemptCeiling ? 'attempt-ceiling-reached' : 'max-nudges-reached',
+      reason: 'max-nudges-reached',
     })
     return
   }
