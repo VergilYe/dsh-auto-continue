@@ -1,0 +1,30 @@
+# dsh-auto-continue v2 — keep a turn from closing on an unfinished reply.
+#
+# Three behaviours, all optional:
+#   1. streamGuard — on `llm/stream`, a silent stall or a mid-thought stop becomes a
+#      retryable error, so DSH's own retry re-sends inside the same step.
+#   2. completionProtocol — injects one system-prompt section asking for an explicit
+#      end-of-reply fenced block (```done / ```ask). Declared ⇒ close; missing after
+#      real work ⇒ one short push.
+#   3. heuristic scopes (retryScope / truncationScope / extendedScope) — used when the
+#      protocol is off.
+#
+# No provider/model route and no credential is preset here; `allowModels` defaults to
+# the route these incidents were measured on and is documented in README.md.
+- insert:
+    - id: auto-continue
+      name: dsh-auto-continue
+      config:
+        enabled: true
+        maxNudges: 2
+        delayMs: 0
+        dryRun: false
+        completionProtocol: true
+        markerStyle: fence-check
+        streamGuard: true
+        streamIdleMs: 90000
+        maxGuardRetries: 1
+        retryScope: true
+        truncationScope: true
+        extendedScope: true
+        logDecisions: true

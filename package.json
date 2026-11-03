@@ -1,0 +1,42 @@
+{
+  "name": "dsh-auto-continue",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Keeps a turn from closing on an unfinished reply: a llm/stream guard turns silent truncation into a retry, and a completion protocol asks the model to declare how the turn ended",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-loop",
+    "turn-stopping",
+    "steering",
+    "auto-continue"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto Continue",
+    "description": "Turns a silently truncated or half-finished model stream into a retry, and asks the model to declare how each turn ended, so a turn no longer closes on a plan."
+  }
+}

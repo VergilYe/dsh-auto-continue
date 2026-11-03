@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Auto continue">
+  <!-- Original artwork: a turn that resumes after being cut, drawn as a broken ring
+       with an arrow re-entering it and a check mark for the declared ending. -->
+  <g fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20.2 12a8.2 8.2 0 1 1-2.4-5.8" />
+    <path d="M20.6 4.2v4.4h-4.4" />
+  </g>
+  <path d="M8.4 12.2l2.4 2.6 4.6-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
