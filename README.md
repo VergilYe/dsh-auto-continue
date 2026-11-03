@@ -26,7 +26,7 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
                                     ↓ 本插件返回 {kind:'retry'} → 同一步内重发
 ```
 
-- 只对 `allowModels` 路由生效，跳过 `purpose` 为标题/压缩的辅助请求。
+- 默认对所有路由生效（`allowModels` 为空数组）；配了白名单则只对名单内路由生效。跳过 `purpose` 为标题/压缩的辅助请求。
 - 截断改判每会话最多 `maxGuardRetries` 次；一条干净收尾的流会把额度还回来。
 - 每个 `(agent,turn,step)` 的 guard 重试也封顶，用尽后交给正常重试策略。
 - 判定前先剥离协议块，否则每一条健康的 ```` ```done ```` 收尾都会被当成「没说完」而无限重试。
@@ -84,7 +84,7 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 | `maxGuardRetries` | `1` | 截断改判上限 / 每 step guard 重试上限 |
 | `retryScope` / `truncationScope` / `extendedScope` | `true` | 兜底三域 |
 | `retryCodes` | TRANSPORT/TIMEOUT/SERVER | 算「供应商侧故障」的码 |
-| `allowModels` | `['open-design/deepseek-v4.1-flash']` | 空数组 = 全部启用 |
+| `allowModels` | `[]` | 生效路由；默认空数组 = 全部路由，收窄时填 `provider/model` 列表 |
 | `planPatterns` / `isAskingPatterns` | 见代码 | 正则源串，非法项被忽略 |
 | `nudgeText` / `protocolNudgeText` / `giveUpNoticeText` | 见代码 | 推送正文 / 放弃提示正文 |
 | `logDecisions` / `logFile` | `false` / `$DSH_HOME/dsh-auto-continue/events.jsonl` | 诊断日志 |
@@ -109,7 +109,7 @@ cd plugins/dsh-auto-continue
 npm test        # = node --test "test/*.test.mjs"
 ```
 
-当前：**59 tests / 59 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次且留 `giveup` 事件、有推进的推送不吃额度、长回合不被尝试上限截断、上限可配置）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/白名单与辅助请求放行。
+当前：**61 tests / 61 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判 / 默认全路由 vs 显式白名单）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次且留 `giveup` 事件、有推进的推送不吃额度、长回合无总次数上限）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/辅助请求放行与白名单收窄。
 
 ## 已知限制
 
@@ -142,17 +142,34 @@ dsh plugin add git+https://github.com/VergilYe/dsh-auto-continue.git
 `$DSH_HOME/dsh-auto-continue/events.jsonl`（诊断日志，含末段文本片段与 sessionId，
 只留在本机；不想留可把 `logDecisions` 设为 `false`）。
 
-### 装完必做：把 `allowModels` 指到自己的路由
+### 下载即用
 
-`allowModels` 默认只有 `['open-design/deepseek-v4.1-flash']`——这是标定行为时用的那条
-路由。**换成别的路由后不会报错，只是完全不生效**：判定直接返回 `model-not-allowed`，
-日志里能看见，容易误以为插件坏了。所以装完要做二选一：
+`allowModels` 默认为**空数组 = 所有路由**，所以装完不需要任何配置，你自己的模型直接就是
+生效范围。三层防护（stream guard / 收尾协议 / 兜底三域）会一起对这个 profile 的所有请求
+生效，与具体的 provider/model 无关。
 
-- 改成自己的路由字符串，形如 `provider/model`（本插件日志的 `route` 字段就是实际值）；
-- 或设成空数组 `[]`，所有路由都启用（未标定过的路由上 guard 行为未经验证，建议先只开
-  自己常用的那条）。
+### 只想对某些模型生效（可选）
 
-其余默认值可以直接用。
+如果不想让别的模型也被这套行为管，在 **profile 自己的补丁层**里按行 id 覆盖即可：
+
+`~/.dsh/profiles/<profile>/cordis.patch.yml`
+
+```yaml
+- id: auto-continue
+  name: dsh-auto-continue
+  config:
+    allowModels:
+      - open-design/deepseek-v4.1-flash
+      - zai-coding-cn/glm-5.3
+```
+
+- 行 id 是 bundle 补丁里的 `auto-continue`（`plugin_manager` 报出的 `include:auto-continue`
+  是宿主内层 id，写补丁时用前者）。
+- 这个补丁层「在 bundle 层之后应用」，所以能覆盖插件自带配置，插件升级也不会被冲掉。
+- 想查实际路由字符串：看 `$DSH_HOME/dsh-auto-continue/events.jsonl` 里的 `route` 字段。
+- 空数组或省略该键 = 全部路由（默认）。
+
+同一段 YAML 也可以直接交给你的 AI agent 去写——它有文件读写权限即可完成，不需要额外工具。
 
 ### 在插件市场里找到它
 

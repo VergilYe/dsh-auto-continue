@@ -9,11 +9,10 @@
 #   3. heuristic scopes (retryScope / truncationScope / extendedScope) — used when the
 #      protocol is off.
 #
-# No provider/model route and no credential is preset here; `allowModels` is not set,
-# so it falls back to the default: the single route these incidents were measured on.
-# A fresh install on any other route does nothing at all (the decision returns
-# `model-not-allowed`, without an error). Point it at your own `provider/model`
-# route, or set it to [] to enable every route. See "装完必做" in README.md.
+# No provider/model route and no credential is preset here. `allowModels` is left unset,
+# which means every route: a fresh install must work on whichever model the user runs.
+# To narrow it, override this row's config in the profile patch layer (see "只想对某些模型
+# 生效" in README.md) rather than here, so an upgrade cannot wipe that choice.
 - insert:
     - id: auto-continue
       name: dsh-auto-continue

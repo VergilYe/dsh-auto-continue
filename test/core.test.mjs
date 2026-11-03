@@ -222,7 +222,10 @@ test('decide/protocol: an announced plan with zero tool calls is still pushed', 
 
 test('decide: gates hold regardless of the protocol', () => {
   const options = resolveConfig({});
-  assert.equal(decide(folded(`x\n${doneBlock('y')}`), 'other/model', options).reason, 'model-not-allowed');
+  // An explicit allowlist still gates foreign routes; the default (empty) gates nothing.
+  const narrowed = resolveConfig({ allowModels: [ROUTE] });
+  assert.equal(decide(folded(`x\n${doneBlock('y')}`), 'other/model', narrowed).reason, 'model-not-allowed');
+  assert.equal(decide(folded(`x\n${doneBlock('y')}`), 'other/model', options).reason, 'protocol-done');
   const noStop = folded(`x\n${doneBlock('y')}`);
   noStop.final.stopReason = 'max-tokens';
   assert.equal(decide(noStop, ROUTE, options).nudge, false);

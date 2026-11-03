@@ -351,11 +351,7 @@ test('listener: an active goal is skipped', async () => {
   assert.ok(readLines(log.file).some((line) => line.reason === 'goal-active'));
 });
 
-test('listener: a non-allowlisted route is skipped', async () => {
-  const log = tmpLog();
-  const { ctx, handlers } = makeCtx();
-  apply(ctx, { logFile: log.file, logDecisions: true });
-  const steers = [];
+const foreignRouteSession = () => {
   const events = [
     turnStart(1),
     userMessage(2, 'user'),
@@ -367,7 +363,27 @@ test('listener: a non-allowlisted route is skipped', async () => {
       return event;
     })(),
   ];
-  const agent = makeAgent(makeSession(events), { steers });
+  return makeSession(events);
+};
+
+test('listener: the default covers every route, so a fresh install works', async () => {
+  // No allowModels configured: whoever installed the plugin must get the behaviour on
+  // their own route, not only on the one it was measured on.
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: log.file, logDecisions: true });
+  const steers = [];
+  const agent = makeAgent(foreignRouteSession(), { steers });
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  assert.equal(pushesOf(steers).length, 1, 'a foreign route must be handled by default');
+});
+
+test('listener: an explicit allowlist still narrows the plugin', async () => {
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: log.file, logDecisions: true, allowModels: ['open-design/deepseek-v4.1-flash'] });
+  const steers = [];
+  const agent = makeAgent(foreignRouteSession(), { steers });
   await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
   assert.equal(steers.length, 0);
   assert.ok(readLines(log.file).some((line) => line.reason === 'model-not-allowed'));
@@ -550,9 +566,9 @@ test('guard: inspectFinish table', () => {
   assert.deepEqual([...GUARD_CODES], [STREAM_STALL_CODE, STREAM_TRUNCATED_CODE]);
 });
 
-test('guard wiring: auxiliary purposes and foreign routes pass through unguarded', async () => {
+test('guard wiring: auxiliary purposes pass through, and an allowlist narrows the guard', async () => {
   const { ctx, handlers } = makeCtx();
-  apply(ctx, { logFile: tmpLog().file });
+  apply(ctx, { logFile: tmpLog().file, allowModels: ['open-design/deepseek-v4.1-flash'] });
 
   const [streamHandler] = handlers.get('llm/stream');
   const chunks = [{ type: 'text-delta', index: 0, text: '半句：' }, { type: 'finish', reason: { kind: 'stop' } }];
@@ -565,12 +581,23 @@ test('guard wiring: auxiliary purposes and foreign routes pass through unguarded
   const foreign = await collect(
     streamHandler({ provider: 'other', model: 'x', sessionId: 's1' }, () => upstreamOf(chunks)),
   );
-  assert.equal(foreign.at(-1).reason.kind, 'stop', 'foreign routes are never guarded');
+  assert.equal(foreign.at(-1).reason.kind, 'stop', 'a route outside an explicit allowlist is never guarded');
 
   const guarded = await collect(
     streamHandler({ provider: 'open-design', model: 'deepseek-v4.1-flash', sessionId: 's1' }, () => upstreamOf(chunks)),
   );
   assert.equal(guarded.at(-1).reason.failure.code, STREAM_TRUNCATED_CODE);
+});
+
+test('guard wiring: with no allowlist every route is guarded', async () => {
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: tmpLog().file });
+  const [streamHandler] = handlers.get('llm/stream');
+  const chunks = [{ type: 'text-delta', index: 0, text: '半句：' }, { type: 'finish', reason: { kind: 'stop' } }];
+  const foreign = await collect(
+    streamHandler({ provider: 'other', model: 'x', sessionId: 's2' }, () => upstreamOf(chunks)),
+  );
+  assert.equal(foreign.at(-1).reason.failure.code, STREAM_TRUNCATED_CODE, 'the default protects every route');
 });
 
 test('guard wiring: request-error retries up to maxGuardRetries then delegates', async () => {

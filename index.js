@@ -110,8 +110,12 @@ export const DEFAULT_ASKING_PATTERNS = Object.freeze([
   'your call',
 ])
 
-/** Only the route these incidents were measured on. */
-export const DEFAULT_ALLOW_MODELS = Object.freeze(['open-design/deepseek-v4.1-flash'])
+/**
+ * Routes the plugin acts on. Empty means every route: a fresh install must work for
+ * whoever installed it, without first discovering and hand-editing an allowlist. Narrow
+ * it in the profile patch layer when a route needs to stay untouched.
+ */
+export const DEFAULT_ALLOW_MODELS = Object.freeze([])
 
 /** Provider failure codes that mean "the answer was cut". */
 export const DEFAULT_RETRY_CODES = Object.freeze(['TRANSPORT', 'TIMEOUT', 'SERVER'])
