@@ -126,8 +126,22 @@ plugin_manager  action: install_bundle  target: <clone 出来的目录>
 plugin_manager  action: remove_bundle   target: dsh-auto-continue
 ```
 
-本包 `private: true`，不发布到 npm —— 它是一个 profile bundle，由 DSH 的插件管理器落地。
-不读凭据、不联网、无遥测；只写 `$DSH_HOME/dsh-auto-continue/events.jsonl`。
+也可以直接让 DSH 从 GitHub 安装（profile bundle 走 bundle patch，不需要构建）：
+
+```
+dsh plugin add git+https://github.com/VergilYe/dsh-auto-continue.git
+```
+
+零依赖、无安装脚本、无构建步骤，装完即用。不读凭据、不联网、无遥测；只写
+`$DSH_HOME/dsh-auto-continue/events.jsonl`。
+
+### 在插件市场里找到它
+
+DSH 的「市场」读取社区索引
+[`dsh-plugin-catalog`](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)。
+本插件的收录条目已准备好（[`market/VergilYe__dsh-auto-continue.yml`](market/VergilYe__dsh-auto-continue.yml)），
+投稿步骤与 CI 要求见 [PUBLISHING.md](PUBLISHING.md)。
+收录后可在 **设置 → 插件 → 市场** 直接搜索 `auto continue` 一键安装。
 
 ## 它解决什么问题（背景）
 
