@@ -109,10 +109,46 @@ test('parse: the later block wins', () => {
   assert.equal(parseProtocol(text, options).verdict, 'ask');
 });
 
-test('parse: a marker mentioned mid-text is not a declaration', () => {
+test('parse: a declaration that is not the last thing is not a declaration', () => {
   const options = resolveConfig({});
-  const text = `协议要求用 ${DONE_OPEN} 收尾。\n\n${'细节行\n'.repeat(6)}现在检查这两点。`;
-  assert.equal(parseProtocol(text, options).verdict, 'missing');
+  // Real shape from the wild: the model writes the done block, then immediately takes it
+  // back ("wait, I am not finished") and keeps talking. That must not close the turn.
+  const tookBack = [
+    '先看橡皮擦的实现。',
+    '',
+    doneBlock('无（本轮收到新需求，开始调研）'),
+    '',
+    '等等，我还没做完，不能给 done。先调研。',
+  ].join('\n');
+  assert.equal(parseProtocol(tookBack, options).verdict, 'missing');
+
+  // A second, ordinary code block after the declaration: also not the last thing.
+  const trailingCode = ['改好了。', doneBlock('修好 3 个 bug'), '', '```js', 'const a = 1', '```'].join('\n');
+  assert.equal(parseProtocol(trailingCode, options).verdict, 'missing');
+
+  // Prose after an ask block has the same problem.
+  const askThenMore = ['还没定。', askBlock('同步 V2.4 吗'), '', '我先按不同步准备。'].join('\n');
+  assert.equal(parseProtocol(askThenMore, options).verdict, 'missing');
+});
+
+test('parse: trailing syntax noise after the block also fails the last-thing test', () => {
+  // Known trade-off of the structural rule: leftovers that are not prose (a stray fence or
+  // tool-call syntax the model leaked) make the block not-last, so the listener pushes
+  // once. That costs one re-open, and the model simply repeats its declaration.
+  const options = resolveConfig({});
+  const leaked = ['改好了。', doneBlock('余额 chip 已改'), '', '</｜｜DSML｜｜ calls>'].join('\n');
+  assert.equal(parseProtocol(leaked, options).verdict, 'missing');
+  const strayFence = ['改好了。', doneBlock('余额 chip 已改'), '', '````'].join('\n');
+  assert.equal(parseProtocol(strayFence, options).verdict, 'missing');
+});
+
+test('parse: the declaration closes the turn only as the final block', () => {
+  const options = resolveConfig({});
+  const ok = ['结论：料号在三机型主材表里都有。', '', doneBlock('核对了 3 个机型 244/251/252 行')].join('\n');
+  assert.equal(parseProtocol(ok, options).verdict, 'done');
+  // A code sample *before* the declaration is fine: the declaration is still last.
+  const withSample = ['示例：', '', '```js', 'const a = 1', '```', '', doneBlock('示例已给出')].join('\n');
+  assert.equal(parseProtocol(withSample, options).verdict, 'done');
 });
 
 test('strip: removes the trailing block only', () => {

@@ -746,6 +746,41 @@ export function parseProtocol(text, options) {
 }
 
 /**
+ * Whether the declaration block is the *last* thing in the body.
+ *
+ * The protocol text asks for the block "as the last thing in the message", but a model
+ * that writes "```done" and then keeps talking ("wait, I am not finished yet") used to be
+ * read as done, which closed the turn mid-task. So the bar is structural: the final
+ * non-blank line must close a fenced block, and that block must be the declaration block.
+ * Only that shape counts as a finished reply — trailing prose, a second block, or a
+ * declaration that sits mid-text all mean the turn is not settled.
+ * @param {string} body - final body.
+ * @param {object} options - resolved config.
+ * @returns {boolean}
+ */
+function declarationIsLastBlock(body, options) {
+  const lines = body.split('\n')
+  let end = -1
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (lines[i].trim().length > 0) {
+      end = i
+      break
+    }
+  }
+  if (end < 0) return false
+  // The closing fence must be the last thing: only backticks, nothing after it.
+  if (!/^`{3,}$/.test(lines[end].trim())) return false
+  // Walk up to the fence that opened this block. Whichever fence line we hit first is the
+  // opener, because fenced blocks do not interleave with prose.
+  for (let i = end - 1; i >= 0; i -= 1) {
+    const trimmed = lines[i].trim()
+    if (!trimmed.startsWith(FENCE)) continue
+    return trimmed.startsWith(options.doneMarker) || trimmed.startsWith(options.askMarker)
+  }
+  return false
+}
+
+/**
  * Parse the fenced form: the marker opens a block whose first non-blank line is the
  * declaration body.
  * @param {string} body - final body.
@@ -777,6 +812,11 @@ function parseFencedProtocol(body, options) {
     collected.push(lines[j])
   }
   const summary = collected.join('\n').trim()
+  // A declaration that is not the final block does not close the turn: the model went on
+  // talking after it, so treat it as undeclared and let the listener push once.
+  if (!declarationIsLastBlock(body, options)) {
+    return { verdict: summary.length > 0 ? 'missing' : 'empty', summary }
+  }
   return { verdict: summary.length > 0 ? kind : 'empty', summary }
 }
 
