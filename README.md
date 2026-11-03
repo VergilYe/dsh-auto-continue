@@ -53,6 +53,7 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 | `ask` 且问题非空 | 放行（`protocol-ask`） |
 | 无块 / 摘要为空，且本回合干过活 | 推一次（`protocol-missing` / `protocol-empty`） |
 | 无块 / 摘要为空，且收尾区在讲计划或明显没说完 | 推一次 |
+| **正文完全为空**（一个字都没有），且本回合干过活 | 推一次（`protocol-empty-text`） |
 | 无块，纯聊天（无工具、不像没说完） | 放行（`protocol-pure-chat`） |
 
 标记样式可切：`fence-check`（默认，块内清单）/ `fence`（块内纯文本）/ `line`（`DONE:` 行首）/ `plain`（`[DONE: …]`，仅兼容用）。
@@ -104,13 +105,14 @@ cd plugins/dsh-auto-continue
 npm test        # = node --test "test/*.test.mjs"
 ```
 
-当前：**52 tests / 52 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例、`foldTurn` 记账、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/白名单与辅助请求放行。
+当前：**55 tests / 55 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例（含正文为空但有工具调用）、`foldTurn` 记账、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/白名单与辅助请求放行。
 
 ## 已知限制
 
 - **只治「说得出来」的问题**：网关静默切断、模型自述计划、重连后停半截都能覆盖；真的网络断连仍由 DSH 自己的退避重试处理，SSE 保活做不到（在适配器内部）。
 - **协议依赖模型合规**：漏写标记会被推一次（有上限）。合规率无法事前保证，只能靠日志观测。
 - **不记录 `stopReason` 的路由不可判**（如 `deepseek-account/deepseek-flash`）：判据要求 `stop`，取不到就静默跳过。
+- **协议层依赖宿主提供 `systemPrompt` 服务**：某些上下文里该服务不存在，协议段会静默缺失（日志留一条 `no system-prompt service is mounted`），此时只剩请求层 guard 与兜底三域。
 - **依赖 `Session.eventAt` / `snapshotEvents`**：两者已被标 `@deprecated`，未来移除会让窗口读取返回 `undefined`（只记 skip，不推，不会崩）。
 
 ## 安装 / 卸载
@@ -132,8 +134,21 @@ plugin_manager  action: remove_bundle   target: dsh-auto-continue
 dsh plugin add git+https://github.com/VergilYe/dsh-auto-continue.git
 ```
 
-零依赖、无安装脚本、无构建步骤，装完即用。不读凭据、不联网、无遥测；只写
-`$DSH_HOME/dsh-auto-continue/events.jsonl`。
+零依赖、无安装脚本、无构建步骤。不读凭据、不联网、无遥测；只写
+`$DSH_HOME/dsh-auto-continue/events.jsonl`（诊断日志，含末段文本片段与 sessionId，
+只留在本机；不想留可把 `logDecisions` 设为 `false`）。
+
+### 装完必做：把 `allowModels` 指到自己的路由
+
+`allowModels` 默认只有 `['open-design/deepseek-v4.1-flash']`——这是标定行为时用的那条
+路由。**换成别的路由后不会报错，只是完全不生效**：判定直接返回 `model-not-allowed`，
+日志里能看见，容易误以为插件坏了。所以装完要做二选一：
+
+- 改成自己的路由字符串，形如 `provider/model`（本插件日志的 `route` 字段就是实际值）；
+- 或设成空数组 `[]`，所有路由都启用（未标定过的路由上 guard 行为未经验证，建议先只开
+  自己常用的那条）。
+
+其余默认值可以直接用。
 
 ### 在插件市场里找到它
 

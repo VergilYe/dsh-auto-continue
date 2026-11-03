@@ -188,6 +188,33 @@ test('decide/protocol: pure chat with no work and no announced plan is left alon
   assert.equal(chat.reason, 'protocol-pure-chat');
 });
 
+test('decide/protocol: a body-less reply after real work is pushed', () => {
+  const options = resolveConfig({});
+  // The shape seen in the wild: ten tool calls, then a message whose body is empty
+  // because the whole answer went into the reasoning channel.
+  for (const text of ['', '   \n\t ']) {
+    const blank = decide(folded(text, { toolCalls: 10 }), ROUTE, options);
+    assert.equal(blank.nudge, true, `expected a push for ${JSON.stringify(text)}`);
+    assert.equal(blank.rule, 'protocol-empty-text');
+    // Shares the protocol nudge text, so the model is asked for the closing block.
+    assert.equal(blank.reason, 'protocol-missing');
+  }
+});
+
+test('decide/protocol: a body-less reply with no work stays silent', () => {
+  const options = resolveConfig({});
+  const blank = decide(folded('', { toolCalls: 0 }), ROUTE, options);
+  assert.equal(blank.nudge, false);
+  assert.equal(blank.reason, 'empty-final-text');
+});
+
+test('decide/protocol: with the protocol off a body-less reply keeps the old verdict', () => {
+  const options = resolveConfig({ completionProtocol: false });
+  const blank = decide(folded('', { toolCalls: 10 }), ROUTE, options);
+  assert.equal(blank.nudge, false);
+  assert.equal(blank.reason, 'empty-final-text');
+});
+
 test('decide/protocol: an announced plan with zero tool calls is still pushed', () => {
   const options = resolveConfig({});
   const result = decide(folded('我继续把第三步做完。', { toolCalls: 0 }), ROUTE, options);

@@ -35,7 +35,7 @@ description:
 |---|---|
 | `package.json` declares `dsh.bundle.patch` | ✅ `{"dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}` |
 | `cordis.patch.yml` exists next to it | ✅ |
-| Real, working code (not a placeholder) | ✅ 48 KB host plugin, 52 unit tests |
+| Real, working code (not a placeholder) | ✅ 48 KB host plugin, 55 unit tests |
 | Repository at least 1 day old | ⏳ created 2026-11-03 — submit after it is a day old |
 | Repo carries the `dsh-plugin` topic | ⏳ add it in the repo settings |
 | Description accurate, no marketing language | ✅ describes exactly what the code does |

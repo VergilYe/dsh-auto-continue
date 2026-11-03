@@ -812,7 +812,17 @@ export function decide(folded, route, options) {
 
   const prose = stripProtocolMarkers(folded.final.text ?? '', options)
   const judged = { ...folded, final: { ...folded.final, text: prose } }
-  if (prose.trim().length === 0) return early('empty-final-text')
+  if (prose.trim().length === 0) {
+    // A reply that carries no body at all is not "nothing to judge". When the turn did
+    // real work and then closed without one visible word, the user cannot tell whether
+    // the job finished — the same failure shape as a missing declaration, only worse.
+    // A turn that did no work stays silent, and with the protocol off there is no prose
+    // for the heuristic scopes to read, so both keep the old behaviour.
+    if (options.completionProtocol && folded.toolCalls > 0) {
+      return { nudge: true, rule: 'protocol-empty-text', reason: 'protocol-missing', tail, scopes: [] }
+    }
+    return early('empty-final-text')
+  }
   const scopes = matchedScopes(judged, options)
 
   if (options.completionProtocol) {
