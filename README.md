@@ -74,6 +74,7 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 |---|---|---|
 | `enabled` | `true` | 关掉后不注册任何监听器 |
 | `maxNudges` | `2` | **连续无效**推送上限（推完有推进的不计）；`0` 等同未安装 |
+| `maxAttemptsPerTurn` | `20` | 单 turn 推送次数的**绝对**上限，只防死循环；持续有推进的 turn 可远超 `maxNudges` |
 | `nudgeMinIntervalMs` | `5000` | 两次推送的最小间隔，防止一次短暂断连就把次数烧光 |
 | `delayMs` | `0` | 额外的推送前等待，期间 abort 就放弃 |
 | `dryRun` | `false` | 只记日志不推 |
@@ -92,14 +93,15 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 ## 安全阀
 
 1. 额度只记「连续无效推送」：推完模型确实干了活（有工具调用）就不算消耗，也把之前的欠账清零；连续 `maxNudges` 次推了没反应才停。计数从会话日志的持久记录推导。
-2. 两次推送至少间隔 `nudgeMinIntervalMs`（默认 5 秒），一次瞬时断连不会连着烧掉额度。
-3. **放弃时会在对话里留一条可见提示**（`giveUpNoticeText`），说明自动续接已停止、可能是上游断连或配额问题，每个 turn 只留一次。
-4. 同 turn 同末条消息指纹只推一次。
-5. `goal.phase === 'active'` 时整个跳过（不与 goal round driver 抢）。
-6. 中途人类接管（首条 assistant 之后的人类消息）清零计数、指纹与放弃标记；**开局 prompt 不算**。
-7. `signal.aborted` / `agent.status !== 'running'` / 非白名单路由不推。
-8. 监听器内所有异常吞掉并记日志，绝不冒泡到主循环。
-9. 截断改判与 guard 重试都有上限，`maxGuardRetries` 用尽后放行。
+2. 单 turn 另有 `maxAttemptsPerTurn`（默认 20）做绝对上限，只用来兜死循环——它刻意远高于 `maxNudges`，避免「一直在推进」的健康回合被安全网误杀。
+3. 两次推送至少间隔 `nudgeMinIntervalMs`（默认 5 秒），一次瞬时断连不会连着烧掉额度。
+4. **放弃时会在对话里留一条可见提示**（`giveUpNoticeText`），说明自动续接已停止、可能是上游断连或配额问题，每个 turn 只留一次；同时写一条 `event: giveup` 日志（`reason` 区分 `max-nudges-reached` 与 `attempt-ceiling`）。
+5. 同 turn 同末条消息指纹只推一次。
+6. `goal.phase === 'active'` 时整个跳过（不与 goal round driver 抢）。
+7. 中途人类接管（首条 assistant 之后的人类消息）清零计数、指纹与放弃标记；**开局 prompt 不算**。
+8. `signal.aborted` / `agent.status !== 'running'` / 非白名单路由不推。
+9. 监听器内所有异常吞掉并记日志，绝不冒泡到主循环。
+10. 截断改判与 guard 重试都有上限，`maxGuardRetries` 用尽后放行。
 
 ## 验证
 
@@ -108,7 +110,7 @@ cd plugins/dsh-auto-continue
 npm test        # = node --test "test/*.test.mjs"
 ```
 
-当前：**57 tests / 57 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次、有推进的推送不吃额度）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/白名单与辅助请求放行。
+当前：**59 tests / 59 pass**。覆盖配置解析、标记解析（四种样式）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次且留 `giveup` 事件、有推进的推送不吃额度、长回合不被尝试上限截断、上限可配置）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/白名单与辅助请求放行。
 
 ## 已知限制
 

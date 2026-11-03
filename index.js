@@ -160,6 +160,7 @@ const SUMMARY_MAX_CHARS = 120
 export const DEFAULTS = Object.freeze({
   enabled: true,
   maxNudges: 2,
+  maxAttemptsPerTurn: 20,
   nudgeMinIntervalMs: 5_000,
   delayMs: 0,
   dryRun: false,
@@ -266,6 +267,9 @@ export function resolveConfig(raw) {
   return {
     enabled: bool(input.enabled, DEFAULTS.enabled),
     maxNudges: isCount(input.maxNudges) ? input.maxNudges : DEFAULTS.maxNudges,
+    maxAttemptsPerTurn: isCount(input.maxAttemptsPerTurn)
+      ? input.maxAttemptsPerTurn
+      : DEFAULTS.maxAttemptsPerTurn,
     nudgeMinIntervalMs: isCount(input.nudgeMinIntervalMs)
       ? input.nudgeMinIntervalMs
       : DEFAULTS.nudgeMinIntervalMs,
@@ -1180,17 +1184,24 @@ async function onTurnStopping(ctx, options, states, payload) {
   const durableStreak = folded.unproductiveStreak ?? 0
   state.count = durableStreak
   // Absolute guard for the pathological case where our pushed message never becomes
-  // visible in the log (then the streak would stay 0 forever): a turn can still only
-  // make so many attempts.
-  const attemptCeiling = Math.max(options.maxNudges, options.maxNudges * 3)
+  // visible in the log (then the streak would stay 0 forever). It must sit well above the
+  // unproductive budget: a turn that keeps making progress may legitimately be re-opened
+  // many times, and this net is here to stop a runaway, not to cap healthy work.
+  const attemptCeiling = options.maxAttemptsPerTurn
   if (state.count >= options.maxNudges || state.attempts >= attemptCeiling) {
     // R5: when we really give up, say so in the conversation instead of closing silently.
     if (!state.gaveUp) {
       state.gaveUp = true
       try {
-        agent.steer(
-          buildNudgeMessage({ turn, rule: 'give-up', text: options.giveUpNoticeText }),
-        )
+        const notice = buildNudgeMessage({ turn, rule: 'give-up', text: options.giveUpNoticeText })
+        agent.steer(notice)
+        writePluginLog(options, ctx, {
+          event: 'giveup',
+          turn,
+          reason: state.attempts >= attemptCeiling ? 'attempt-ceiling' : 'max-nudges-reached',
+          attempts: state.attempts,
+          messageId: notice.id,
+        })
       } catch {
         /* a failed notice must never take the turn down */
       }
@@ -1200,7 +1211,7 @@ async function onTurnStopping(ctx, options, states, payload) {
       priorNudges: state.count,
       attempts: state.attempts,
       nudge: false,
-      reason: 'max-nudges-reached',
+      reason: state.attempts >= attemptCeiling ? 'attempt-ceiling-reached' : 'max-nudges-reached',
     })
     return
   }
