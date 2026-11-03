@@ -181,31 +181,29 @@ test('decide/protocol: an empty summary is pushed', () => {
   assert.equal(result.rule, 'protocol-empty');
 });
 
-test('decide/protocol: pure chat with no work and no announced plan is left alone', () => {
+test('decide/protocol: plain chat without a declaration is pushed too', () => {
+  // The protocol asks for a declaration at the end of every reply, so "looks like chat"
+  // is not an exemption any more: the turn must not close on an undeclared reply.
   const options = resolveConfig({});
   const chat = decide(folded('好的，明白了。', { toolCalls: 0 }), ROUTE, options);
-  assert.equal(chat.nudge, false);
-  assert.equal(chat.reason, 'protocol-pure-chat');
+  assert.equal(chat.nudge, true);
+  assert.equal(chat.rule, 'protocol-missing');
+  assert.equal(chat.reason, 'protocol-missing');
 });
 
-test('decide/protocol: a body-less reply after real work is pushed', () => {
+test('decide/protocol: a body-less reply is pushed with or without work', () => {
   const options = resolveConfig({});
-  // The shape seen in the wild: ten tool calls, then a message whose body is empty
-  // because the whole answer went into the reasoning channel.
-  for (const text of ['', '   \n\t ']) {
-    const blank = decide(folded(text, { toolCalls: 10 }), ROUTE, options);
-    assert.equal(blank.nudge, true, `expected a push for ${JSON.stringify(text)}`);
-    assert.equal(blank.rule, 'protocol-empty-text');
-    // Shares the protocol nudge text, so the model is asked for the closing block.
-    assert.equal(blank.reason, 'protocol-missing');
+  // The shape seen in the wild: the whole answer went into the reasoning channel, so the
+  // visible body is empty. Whether the turn did tool work must not change the verdict.
+  for (const toolCalls of [10, 0]) {
+    for (const text of ['', '   \n\t ']) {
+      const blank = decide(folded(text, { toolCalls }), ROUTE, options);
+      assert.equal(blank.nudge, true, `expected a push for ${JSON.stringify(text)}/${toolCalls}`);
+      assert.equal(blank.rule, 'protocol-empty-text');
+      // Shares the protocol nudge text, so the model is asked for the closing block.
+      assert.equal(blank.reason, 'protocol-missing');
+    }
   }
-});
-
-test('decide/protocol: a body-less reply with no work stays silent', () => {
-  const options = resolveConfig({});
-  const blank = decide(folded('', { toolCalls: 0 }), ROUTE, options);
-  assert.equal(blank.nudge, false);
-  assert.equal(blank.reason, 'empty-final-text');
 });
 
 test('decide/protocol: with the protocol off a body-less reply keeps the old verdict', () => {
@@ -294,6 +292,36 @@ test('foldTurn: counts work, retries, pushes and real takeovers', () => {
   assert.equal(result.final.stopReason, 'stop');
 });
 
+test('foldTurn: only pushes that led nowhere count as unproductive', () => {
+  const push = (seq) => ({ type: 'user/message', seq, data: { id: `n${seq}`, role: 'user', source: { kind: SOURCE_KIND }, content: [] }, time: seq * 1000 });
+  const work = (seq) => ({ type: 'tool/call', seq, data: { turn: 1, step: 1 } });
+  const open = [
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    push(2),
+    work(3),
+    push(4),
+    work(5),
+  ];
+  const productive = foldTurn(open);
+  assert.equal(productive.pushes, 2);
+  assert.equal(productive.productivePushes, 2);
+  assert.equal(productive.unproductiveStreak, 0, 'work after every push means no debt');
+  assert.equal(productive.lastPushTime, 4000);
+
+  const idle = foldTurn([{ type: 'turn/start', seq: 1, data: { turn: 1 } }, push(2), push(3)]);
+  assert.equal(idle.unproductiveStreak, 2, 'two pushes with no work between them');
+
+  // A productive push clears the debt that came before it.
+  const mixed = foldTurn([
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    push(2),
+    push(3),
+    work(4),
+  ]);
+  assert.equal(mixed.pushes, 2);
+  assert.equal(mixed.unproductiveStreak, 0, 'the last push produced work');
+});
+
 test('foldTurn: a message without a replay envelope is never the final message', () => {
   const events = [
     { type: 'turn/start', seq: 1, data: { turn: 1 } },
@@ -307,9 +335,13 @@ test('stateFor: takeover resets the bookkeeping, turn change resets it', () => {
   const states = new Map();
   const a = stateFor(states, 'a', 1, folded('x'));
   a.count = 2;
+  a.attempts = 3;
+  a.gaveUp = true;
   a.fingerprints.add('f');
   const b = stateFor(states, 'a', 1, folded('x', { userInputs: 1 }));
   assert.equal(b.count, 0);
+  assert.equal(b.attempts, 0, 'a fresh human message restores the push budget');
+  assert.equal(b.gaveUp, false, 'and re-arms the give-up notice');
   assert.equal(b.fingerprints.size, 0);
   const c = stateFor(states, 'a', 2, folded('x', { userInputs: 1 }));
   assert.equal(c.turn, 2);

@@ -160,6 +160,7 @@ const SUMMARY_MAX_CHARS = 120
 export const DEFAULTS = Object.freeze({
   enabled: true,
   maxNudges: 2,
+  nudgeMinIntervalMs: 5_000,
   delayMs: 0,
   dryRun: false,
   retryScope: true,
@@ -172,6 +173,8 @@ export const DEFAULTS = Object.freeze({
   markerStyle: 'fence-check',
   protocolNudgeText:
     '继续。若还有没做完的事就直接做完；完成时用 done 代码块收尾，需要我拍板时用 ask 代码块。',
+  giveUpNoticeText:
+    '（自动续接已停止：本轮多次推送都没有收到收尾声明。可能是上游断连或配额问题，请检查后手动继续。）',
   nudgeText: DEFAULT_NUDGE_TEXT,
   logDecisions: false,
   logFile: '',
@@ -263,6 +266,9 @@ export function resolveConfig(raw) {
   return {
     enabled: bool(input.enabled, DEFAULTS.enabled),
     maxNudges: isCount(input.maxNudges) ? input.maxNudges : DEFAULTS.maxNudges,
+    nudgeMinIntervalMs: isCount(input.nudgeMinIntervalMs)
+      ? input.nudgeMinIntervalMs
+      : DEFAULTS.nudgeMinIntervalMs,
     delayMs: isCount(input.delayMs) ? input.delayMs : DEFAULTS.delayMs,
     dryRun: bool(input.dryRun, DEFAULTS.dryRun),
     retryScope: bool(input.retryScope, DEFAULTS.retryScope),
@@ -276,6 +282,7 @@ export function resolveConfig(raw) {
     completionProtocol: bool(input.completionProtocol, DEFAULTS.completionProtocol),
     ...markers,
     protocolNudgeText: text(input.protocolNudgeText, DEFAULTS.protocolNudgeText),
+    giveUpNoticeText: text(input.giveUpNoticeText, DEFAULTS.giveUpNoticeText),
     nudgeText: text(input.nudgeText, DEFAULT_NUDGE_TEXT),
     allowModels,
     retryCodes: Array.isArray(input.retryCodes)
@@ -416,10 +423,14 @@ export function foldTurn(events) {
   let hadRetry = false
   let toolCalls = 0
   let userInputs = 0
-  let pushes = 0
   let final = null
   let firstAssistantSeq
+  let lastPushTime
   const retryCodes = new Set()
+  // Every push we made this turn, plus whether the model actually did anything after
+  // it. A push that produced work was not wasted, so it must not eat the budget.
+  const pushes = []
+  let workSincePush = false
 
   for (const event of events) {
     if (event === undefined || event === null) continue
@@ -432,12 +443,17 @@ export function foldTurn(events) {
       }
       case 'tool/call':
         toolCalls += 1
+        workSincePush = true
         break
       case 'user/message': {
         const kind = event.data?.source?.kind
         if (kind === SOURCE_KIND) {
-          // Durable count of our own pushes: survives reloads and duplicate instances.
-          pushes += 1
+          // Durable record of our own pushes: survives reloads and duplicate instances.
+          const previous = pushes[pushes.length - 1]
+          if (previous !== undefined) previous.productive = workSincePush
+          pushes.push({ productive: false, time: event.time })
+          workSincePush = false
+          lastPushTime = event.time
           break
         }
         // Only a message *after* the first assistant output is a takeover; the prompt
@@ -468,7 +484,26 @@ export function foldTurn(events) {
     }
   }
 
-  return { hadRetry, toolCalls, userInputs, pushes, final, retryCodes: [...retryCodes] }
+  const last = pushes[pushes.length - 1]
+  if (last !== undefined) last.productive = workSincePush
+  // Trailing run of pushes that led nowhere: that is the only budget worth counting.
+  let unproductiveStreak = 0
+  for (let i = pushes.length - 1; i >= 0; i -= 1) {
+    if (pushes[i].productive) break
+    unproductiveStreak += 1
+  }
+
+  return {
+    hadRetry,
+    toolCalls,
+    userInputs,
+    pushes: pushes.length,
+    productivePushes: pushes.filter((push) => push.productive).length,
+    unproductiveStreak,
+    lastPushTime,
+    final,
+    retryCodes: [...retryCodes],
+  }
 }
 
 /**
@@ -812,36 +847,31 @@ export function decide(folded, route, options) {
 
   const prose = stripProtocolMarkers(folded.final.text ?? '', options)
   const judged = { ...folded, final: { ...folded.final, text: prose } }
-  if (prose.trim().length === 0) {
-    // A reply that carries no body at all is not "nothing to judge". When the turn did
-    // real work and then closed without one visible word, the user cannot tell whether
-    // the job finished — the same failure shape as a missing declaration, only worse.
-    // A turn that did no work stays silent, and with the protocol off there is no prose
-    // for the heuristic scopes to read, so both keep the old behaviour.
-    if (options.completionProtocol && folded.toolCalls > 0) {
-      return { nudge: true, rule: 'protocol-empty-text', reason: 'protocol-missing', tail, scopes: [] }
-    }
-    return early('empty-final-text')
-  }
   const scopes = matchedScopes(judged, options)
 
   if (options.completionProtocol) {
+    // The protocol asks for a declaration at the end of every reply, so a missing one
+    // must never be allowed to close the turn — whatever the shape of the reply. An
+    // empty body, a plan announcement and ordinary chatter all read as "not declared".
     const protocol = parseProtocol(folded.final.text ?? '', options)
     if (protocol.verdict === 'done' || protocol.verdict === 'ask') {
       return { nudge: false, rule: 'none', reason: `protocol-${protocol.verdict}`, tail, scopes }
     }
-    const announced = matchesPlanTail(judged, options) || !isSettled(prose)
-    if (folded.toolCalls > 0 || announced) {
-      return {
-        nudge: true,
-        rule: protocol.verdict === 'empty' ? 'protocol-empty' : 'protocol-missing',
-        reason: 'protocol-missing',
-        tail,
-        scopes,
-      }
+    const emptyProse = prose.trim().length === 0
+    return {
+      nudge: true,
+      rule: emptyProse
+        ? 'protocol-empty-text'
+        : protocol.verdict === 'empty'
+          ? 'protocol-empty'
+          : 'protocol-missing',
+      reason: 'protocol-missing',
+      tail,
+      scopes,
     }
-    return { nudge: false, rule: 'none', reason: 'protocol-pure-chat', tail, scopes }
   }
+
+  if (prose.trim().length === 0) return early('empty-final-text')
 
   const planOnly = scopes.length > 0 && scopes.every((scope) => scope === 'plan')
   if (folded.toolCalls === 0 && !planOnly) return early('no-work-this-turn')
@@ -1057,10 +1087,12 @@ export function writePluginLog(options, ctx, record) {
 export function stateFor(states, agentId, turn, folded) {
   let state = states.get(agentId)
   if (state === undefined || state.turn !== turn) {
-    state = { turn, count: 0, fingerprints: new Set() }
+    state = { turn, count: 0, attempts: 0, gaveUp: false, lastPushAt: undefined, fingerprints: new Set() }
     states.set(agentId, state)
   } else if (folded.userInputs > 0) {
     state.count = 0
+    state.attempts = 0
+    state.gaveUp = false
     state.fingerprints.clear()
   }
   return state
@@ -1142,13 +1174,31 @@ async function onTurnStopping(ctx, options, states, payload) {
     return
   }
 
-  // Durable cap: the log knows how many pushes this turn already holds.
-  const priorPushes = Math.max(state.count, folded.pushes ?? 0)
-  if (priorPushes > state.count) state.count = priorPushes
-  if (priorPushes >= options.maxNudges) {
+  // Budget (R2/R3): only pushes that led nowhere count against it, and a push that made
+  // the model do real work resets the streak — the durable log is the authority, so a
+  // reload or a second instance cannot talk itself out of the cap.
+  const durableStreak = folded.unproductiveStreak ?? 0
+  state.count = durableStreak
+  // Absolute guard for the pathological case where our pushed message never becomes
+  // visible in the log (then the streak would stay 0 forever): a turn can still only
+  // make so many attempts.
+  const attemptCeiling = Math.max(options.maxNudges, options.maxNudges * 3)
+  if (state.count >= options.maxNudges || state.attempts >= attemptCeiling) {
+    // R5: when we really give up, say so in the conversation instead of closing silently.
+    if (!state.gaveUp) {
+      state.gaveUp = true
+      try {
+        agent.steer(
+          buildNudgeMessage({ turn, rule: 'give-up', text: options.giveUpNoticeText }),
+        )
+      } catch {
+        /* a failed notice must never take the turn down */
+      }
+    }
     writePluginLog(options, ctx, {
       ...base,
-      priorNudges: priorPushes,
+      priorNudges: state.count,
+      attempts: state.attempts,
       nudge: false,
       reason: 'max-nudges-reached',
     })
@@ -1166,8 +1216,13 @@ async function onTurnStopping(ctx, options, states, payload) {
     return
   }
 
-  if (options.delayMs > 0) {
-    await sleep(options.delayMs)
+  // R4: never fire two pushes back to back. A one-second upstream hiccup must not eat the
+  // whole budget, so the gap is measured from the last push we actually made.
+  const lastPushAt = state.lastPushAt ?? folded.lastPushTime
+  const sinceLast = typeof lastPushAt === 'number' ? Date.now() - lastPushAt : Number.POSITIVE_INFINITY
+  const waitMs = Math.max(options.delayMs, options.nudgeMinIntervalMs - sinceLast, 0)
+  if (waitMs > 0) {
+    await sleep(waitMs)
     if (signal?.aborted === true) {
       writePluginLog(options, ctx, { ...base, nudge: false, reason: 'turn-aborted-after-delay' })
       return
@@ -1185,13 +1240,16 @@ async function onTurnStopping(ctx, options, states, payload) {
   agent.steer(message)
 
   state.count += 1
+  state.attempts += 1
+  state.lastPushAt = Date.now()
   if (fingerprint !== undefined) state.fingerprints.add(fingerprint)
   writePluginLog(options, ctx, {
     ...base,
     event: 'nudge',
     nudge: true,
     priorNudges: state.count - 1,
-    nudgeIndex: state.count,
+    nudgeIndex: state.attempts,
+    attempts: state.attempts,
     maxNudges: options.maxNudges,
     messageId: message.id,
   })

@@ -119,6 +119,11 @@ async function fire(handlers, name, payload) {
   for (const fn of handlers.get(name) ?? []) await fn(payload);
 }
 
+/** Steers that are real pushes; the give-up notice is a separate kind of message. */
+function pushesOf(steers) {
+  return steers.filter((message) => message.source?.rule !== 'give-up');
+}
+
 function windowSession({ text, withRetry = false, pushes = 0, goalPhase = null, toolCalls = 2 }) {
   const events = [turnStart(1), userMessage(2, 'user')];
   let seq = 3;
@@ -231,13 +236,55 @@ test('listener: maxNudges is enforced from the durable log count', async () => {
   // the session already holds one push from a previous evaluation
   const agent = makeAgent(windowSession({ text: '现在检查这两点。', pushes: 1 }), { steers });
   await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
-  assert.equal(steers.length, 1, 'one push left in the budget');
+  assert.equal(pushesOf(steers).length, 1, 'one push left in the budget');
 
   const blocked = makeAgent(windowSession({ text: '现在检查这两点。', pushes: 2 }), { steers });
   await fire(handlers, 'agent/turn-stopping', { agent: blocked, turn: 1, signal: { aborted: false } });
-  assert.equal(steers.length, 1, 'a session at the cap must not push again');
+  assert.equal(pushesOf(steers).length, 1, 'a session at the cap must not push again');
   const decision = readLines(log.file).filter((line) => line.event === 'decision').at(-1);
   assert.equal(decision.reason, 'max-nudges-reached');
+});
+
+test('listener: giving up leaves a visible notice, once', async () => {
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: log.file, logDecisions: true, maxNudges: 2 });
+  const steers = [];
+  const agent = makeAgent(windowSession({ text: '现在检查这两点。', pushes: 2 }), { steers });
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  const notices = steers.filter((message) => message.source?.rule === 'give-up');
+  assert.equal(notices.length, 1, 'the human is told that auto-continue gave up');
+  assert.match(notices[0].content[0].text, /自动续接已停止/);
+
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  assert.equal(
+    steers.filter((message) => message.source?.rule === 'give-up').length,
+    1,
+    'the notice must not repeat on every later evaluation',
+  );
+});
+
+test('listener: a push that produced work does not consume the budget', async () => {
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: log.file, logDecisions: true, maxNudges: 2 });
+  const steers = [];
+  // Both earlier pushes were followed by real tool work, so the streak is still zero and
+  // the third push must be allowed — that is the "keep pushing while progress happens" rule.
+  const events = [
+    turnStart(1),
+    userMessage(2, 'user'),
+    userMessage(3, SOURCE_KIND),
+    toolCall(1, 4),
+    userMessage(5, SOURCE_KIND),
+    toolCall(1, 6),
+    finalMessage(1, 7, '现在检查这两点。'),
+  ];
+  const agent = makeAgent(makeSession(events), { steers });
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  assert.equal(pushesOf(steers).length, 1, 'a productive push streak leaves room to push');
+  const nudge = readLines(log.file).filter((line) => line.event === 'nudge').at(-1);
+  assert.equal(nudge.attempts, 1);
 });
 
 test('listener: an active goal is skipped', async () => {
