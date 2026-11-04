@@ -35,9 +35,9 @@ description:
 |---|---|
 | `package.json` declares `dsh.bundle.patch` | ✅ `{"dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}` |
 | `cordis.patch.yml` exists next to it | ✅ |
-| Real, working code (not a placeholder) | ✅ 48 KB host plugin, 55 unit tests |
-| Repository at least 1 day old | ⏳ created 2026-11-03 — submit after it is a day old |
-| Repo carries the `dsh-plugin` topic | ⏳ add it in the repo settings |
+| Real, working code (not a placeholder) | ✅ 48 KB host plugin, 63 unit tests |
+| Repository at least 1 day old | ✅ created 2026-11-03, gate re-ran 2026-11-04 and passed |
+| Repo carries the `dsh-plugin` topic | ✅ added |
 | Description accurate, no marketing language | ✅ describes exactly what the code does |
 
 Also recommended by the guide, and satisfied here:
@@ -46,17 +46,40 @@ Also recommended by the guide, and satisfied here:
   `allowBuilds` approval.
 - No `@deepseek-ai/*` runtime dependencies at all, so no prerelease peer-range trap.
 
+## Status
+
+| Item | State |
+|---|---|
+| PR | [awesome-dsh-plugin#11521](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/11521) — open, both checks green, `mergeable_state: clean` |
+| Blocking | nothing on our side; waiting for a maintainer to read the repo and merge |
+| After merge | catalog regenerates from `data/plugins/*.yml` on `main`, CDN copy follows |
+
+## Why this is not a duplicate
+
+Three entries already recover an interrupted turn: `HsiangNianian/dsh-auto-continue`,
+`baosfeng/my-dsh-plugins#dsh-task-reliability`, `haochi72/dsh-auto-continue-429`. All three
+act **after** the reply ends — they decide it looks unfinished and queue another `继续`.
+
+This plugin works one layer earlier, which is what makes two shapes reachable:
+
+| Shape | Why the after-the-fact entries miss it | What this does |
+|---|---|---|
+| Cut stream with a valid `stopReason: "stop"` | nothing looks wrong to a text heuristic; the reply reads as complete | rewrites the stream into a retryable error so the retry happens **inside the same step** |
+| `stopReason: "stop"` with an **empty body** (answer went into the reasoning channel) | there is no text to judge | same in-step retry; the turn never reaches "ended" |
+
+Plus a protocol layer: the model declares its ending with a fenced `done`/`ask` block that
+must be the last thing in the message, so the decision is deterministic instead of a
+phrasing guess.
+
 ## Steps
 
-1. Add the `dsh-plugin` topic to https://github.com/VergilYe/dsh-auto-continue
-   (About → ⚙ → Topics).
-2. Wait until the repository is at least one day old.
-3. Fork `awesome-dsh-plugin/awesome-dsh-plugin`.
-4. Add `data/plugins/VergilYe__dsh-auto-continue.yml` with the content above.
-5. Open a PR titled `Add VergilYe/dsh-auto-continue`.
-6. CI checks the manifest, repo age and formatting; a maintainer reads the repo and
-   merges. The catalog is regenerated from `data/plugins/*.yml` on `main`, and the
-   CDN copy follows shortly after.
+1. ~~Add the `dsh-plugin` topic~~ — done.
+2. ~~Wait until the repository is at least one day old~~ — done (gate passed 2026-11-04).
+3. ~~Fork `awesome-dsh-plugin/awesome-dsh-plugin`~~ — done (`VergilYe/awesome-dsh-plugin`).
+4. ~~Add `data/plugins/VergilYe__dsh-auto-continue.yml`~~ — done.
+5. ~~Open a PR titled `Add VergilYe/dsh-auto-continue`~~ — done: #11521.
+6. Waiting on a maintainer to read the repo and merge. The catalog is regenerated from
+   `data/plugins/*.yml` on `main`, and the CDN copy follows shortly after.
 
 ## After listing
 
