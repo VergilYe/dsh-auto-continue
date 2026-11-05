@@ -50,9 +50,38 @@ Also recommended by the guide, and satisfied here:
 
 | Item | State |
 |---|---|
-| PR | [awesome-dsh-plugin#11521](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/11521) — open, both checks green, `mergeable_state: clean` |
-| Blocking | nothing on our side; waiting for a maintainer to read the repo and merge |
-| After merge | catalog regenerates from `data/plugins/*.yml` on `main`, CDN copy follows |
+| PR | [awesome-dsh-plugin#11521](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/11521) — **merged** by fkysly on 2026-11-05 01:04 (+08) |
+| Upstream entry | `data/plugins/VergilYe__dsh-auto-continue.yml` exists on `main` |
+| npm | **`@vergilye/dsh-auto-continue@2.0.0`** published 2026-11-05 (was missing — see below) |
+| Market listing | waiting on the next nightly catalog rebuild; nothing to do |
+| Blocking | none |
+
+### Why the npm package was the last blocker
+
+A merged entry alone does not put a plugin in the market. `scripts/lib/market-index.mjs`
+in the catalog repository states the rule:
+
+> What can be listed: an entry needs an npm package, an exact version, and that version's
+> publish time. The GitHub-only half of the list cannot be expressed yet.
+
+So the index skips entries without npm (`skipped.noNpm`), and every one of the 4,381
+entries in the published index carries a non-empty `versions`. The same-day merges
+`TLEWA/dsh-if` and `TLEWA/dsh-better-choice` were missing from the index for exactly this
+reason.
+
+The bare name `dsh-auto-continue` is owned by an unrelated package (`spix18`), so this
+ships as `@vergilye/dsh-auto-continue`. `probe-npm.mjs` accepts a package only when its
+`repository` field points back at the same GitHub repo, which this one does.
+
+### After a rename, reinstall the local bundle
+
+The loader row name follows the package name, so a profile that still has the old
+`link:dsh-auto-continue` install will not resolve on its next start:
+
+```
+plugin_manager  action: remove_bundle   target: @vergilye/dsh-auto-continue
+plugin_manager  action: install_bundle  target: F:\SoftWare\DeepseekHarness\本地工作区\plugins\dsh-auto-continue
+```
 
 ## Why this is not a duplicate
 
@@ -77,12 +106,16 @@ phrasing guess.
 2. ~~Wait until the repository is at least one day old~~ — done (gate passed 2026-11-04).
 3. ~~Fork `awesome-dsh-plugin/awesome-dsh-plugin`~~ — done (`VergilYe/awesome-dsh-plugin`).
 4. ~~Add `data/plugins/VergilYe__dsh-auto-continue.yml`~~ — done.
-5. ~~Open a PR titled `Add VergilYe/dsh-auto-continue`~~ — done: #11521.
-6. Waiting on a maintainer to read the repo and merge. The catalog is regenerated from
-   `data/plugins/*.yml` on `main`, and the CDN copy follows shortly after.
+5. ~~Open a PR titled `Add VergilYe/dsh-auto-continue`~~ — done: #11521, merged 2026-11-05.
+6. ~~Publish the package to npm~~ — done: `@vergilye/dsh-auto-continue@2.0.0`.
+7. Waiting on the next nightly catalog rebuild (2026-11-06 10:23 +08). It regenerates the
+   index from `data/plugins/*.yml` plus the npm probe, publishes it to npm, and the CDN
+   copy follows.
 
 ## After listing
 
-Users can then find it under Settings → Plugins → 市场 and install it with one click.
-Publishing to npm additionally lets the market install a prebuilt package, but it is
-not required: this bundle has no install scripts, so source installation works as is.
+Users can then find it under Settings → Plugins → 市场 and install it with one click:
+
+```
+dsh plugin --profile web add @vergilye/dsh-auto-continue
+```
