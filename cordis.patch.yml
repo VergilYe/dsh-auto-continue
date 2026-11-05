@@ -15,7 +15,7 @@
 # 生效" in README.md) rather than here, so an upgrade cannot wipe that choice.
 - insert:
     - id: auto-continue
-      name: dsh-auto-continue
+      name: "@vergilye/dsh-auto-continue"
       config:
         enabled: true
         maxNudges: 2

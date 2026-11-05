@@ -132,10 +132,16 @@ git clone https://github.com/VergilYe/dsh-auto-continue.git
 
 ```
 plugin_manager  action: install_bundle  target: <clone 出来的目录>
-plugin_manager  action: remove_bundle   target: dsh-auto-continue
+plugin_manager  action: remove_bundle   target: @vergilye/dsh-auto-continue
 ```
 
-也可以直接让 DSH 从 GitHub 安装（profile bundle 走 bundle patch，不需要构建）：
+也可以直接从 npm 安装（推荐，市场里的一键安装走的也是这条）：
+
+```
+dsh plugin --profile web add @vergilye/dsh-auto-continue
+```
+
+或者从 GitHub 安装（profile bundle 走 bundle patch，不需要构建）：
 
 ```
 dsh plugin add git+https://github.com/VergilYe/dsh-auto-continue.git
@@ -159,7 +165,7 @@ dsh plugin add git+https://github.com/VergilYe/dsh-auto-continue.git
 
 ```yaml
 - id: auto-continue
-  name: dsh-auto-continue
+  name: "@vergilye/dsh-auto-continue"
   config:
     allowModels:
       - open-design/deepseek-v4.1-flash
