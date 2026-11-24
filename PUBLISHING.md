@@ -52,31 +52,43 @@ Also recommended by the guide, and satisfied here:
 |---|---|
 | PR | [awesome-dsh-plugin#11521](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/11521) — **merged** by fkysly on 2026-11-05 01:04 (+08) |
 | Upstream entry | `data/plugins/VergilYe__dsh-auto-continue.yml` exists on `main` |
-| npm | `@vergilye/dsh-auto-continue@2.0.0` published 2026-11-05; **2.1.0 (overload reconnect) still unpublished** |
-| Market listing | live for 2.0.0; 2.1.0 appears after the next nightly catalog rebuild once npm has it |
-| Blocking | npm auth: no `NPM_TOKEN` / `.npmrc` exists on this machine, so `npm publish` cannot run unattended |
+| npm | **`@vergilye/dsh-auto-continue@2.1.0`** published 2026-11-24 (was 2.0.0) |
+| Market listing | live for 2.0.0; 2.1.0 appears after the next nightly catalog rebuild |
+| Blocking | none |
 
-### Publishing 2.1.0
+### 2.1.0 publish record
 
-The tarball is verified: `npm publish --dry-run` reports the expected 8 files
-(`index.js`, `cordis.patch.yml`, `locale/*.json`, `icon.svg`, `README.md`, `LICENSE`,
-`package.json`), 33.5 kB packed. Only authentication is missing. On a machine that has
-it:
+Published 2026-11-24 by `vergilye <342365289@qq.com>`:
+
+- Tarball: 8 files, 33.8 kB packed / 99.7 kB unpacked
+- `shasum`: `481f292a92c34d9ae747c690152fd89420cf0420`
+- `integrity`: `sha512-qtjICWSSJ6HGdnW7/dy8i2rtDahrFwTzAtTEBbXFsUcpTasSHX9Xos3Eyp0nlcf1hM+ELJTZKy9a5P+8z1XYEg==`
+
+`npm publish` printed its success banner while the registry still answered
+`E404` for about a minute, then `dist-tags.latest` flipped to `2.1.0`. That is
+npm's normal post-publish processing, not a failure — poll the registry rather
+than trusting the first read after publishing.
+
+The published tarball was downloaded back (`npm pack`) and checked before being
+trusted: `classifyOverload`, `FATAL_CODES`, `OVERLOAD_POLICY_KEY` and the
+`overloadReconnect: true` / `overloadRetryIntervalMs: 10_000` defaults are all
+present, and the real-cordis check passes against the unpacked tarball (5
+provider retries, then 15 unbounded reconnects, retry numbers 1–15).
+
+### Publishing a future version
+
+On a machine with an npm token in `~/.npmrc`
+(`//registry.npmjs.org/:_authToken=…`, written by `npm login`):
 
 ```
-npm login                     # browser or OTP, interactive
 npm publish --access public
 ```
 
-Or export a granular publish token first and skip the interactive login:
-
-```
-npm config set //registry.npmjs.org/:_authToken <token>
-npm publish --access public
-```
-
-The market index only lists versions npm actually carries, so 2.1.0 becomes installable
-from the market after both the publish and the next nightly catalog rebuild.
+The market index only lists versions npm actually carries, so a new version
+becomes installable from the market after both the publish and the next nightly
+catalog rebuild. Note that the token lives in plain text in `~/.npmrc`; the
+2.0.0 credential went missing from this machine at some point and had to be
+re-authorised, so prefer a short-lived granular token scoped to this package.
 
 ### Why the npm package was the last blocker
 
