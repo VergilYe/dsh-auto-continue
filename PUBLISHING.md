@@ -52,9 +52,31 @@ Also recommended by the guide, and satisfied here:
 |---|---|
 | PR | [awesome-dsh-plugin#11521](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/11521) — **merged** by fkysly on 2026-11-05 01:04 (+08) |
 | Upstream entry | `data/plugins/VergilYe__dsh-auto-continue.yml` exists on `main` |
-| npm | **`@vergilye/dsh-auto-continue@2.0.0`** published 2026-11-05 (was missing — see below) |
-| Market listing | waiting on the next nightly catalog rebuild; nothing to do |
-| Blocking | none |
+| npm | `@vergilye/dsh-auto-continue@2.0.0` published 2026-11-05; **2.1.0 (overload reconnect) still unpublished** |
+| Market listing | live for 2.0.0; 2.1.0 appears after the next nightly catalog rebuild once npm has it |
+| Blocking | npm auth: no `NPM_TOKEN` / `.npmrc` exists on this machine, so `npm publish` cannot run unattended |
+
+### Publishing 2.1.0
+
+The tarball is verified: `npm publish --dry-run` reports the expected 8 files
+(`index.js`, `cordis.patch.yml`, `locale/*.json`, `icon.svg`, `README.md`, `LICENSE`,
+`package.json`), 33.5 kB packed. Only authentication is missing. On a machine that has
+it:
+
+```
+npm login                     # browser or OTP, interactive
+npm publish --access public
+```
+
+Or export a granular publish token first and skip the interactive login:
+
+```
+npm config set //registry.npmjs.org/:_authToken <token>
+npm publish --access public
+```
+
+The market index only lists versions npm actually carries, so 2.1.0 becomes installable
+from the market after both the publish and the next nightly catalog rebuild.
 
 ### Why the npm package was the last blocker
 
