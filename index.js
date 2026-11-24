@@ -1382,14 +1382,20 @@ export async function reconnectOnOverload(payload, next, options, state, log) {
   const provider = String(payload?.provider ?? 'unknown')
   const turn = payload?.turn
   const step = payload?.step
-  // Bookkeeping is per provider **and** per step: a new step means the previous attempt
-  // series ended (probably successfully), so the reconnect budget must start over.
-  const previous = state.get(provider)
+  const agentId = String(payload?.agent?.id ?? 'unknown')
+  // Keyed by agent **and** provider: two live agents (a session plus a subagent, say) hit
+  // the same provider concurrently, and a provider-only key would let one agent's attempts
+  // inflate the other's visible count. The `agent/disposed` handler then cleans exactly the
+  // entries whose key starts with that agent.
+  const stateKey = `${agentId}|${provider}`
+  // Bookkeeping is also per turn and step: a new step means the previous attempt series
+  // ended (probably successfully), so the reconnect budget must start over.
+  const previous = state.get(stateKey)
   const entry =
     previous !== undefined && previous.turn === turn && previous.step === step
       ? previous
       : { attempts: 0, since: Date.now(), turn, step }
-  state.set(provider, entry)
+  state.set(stateKey, entry)
   entry.attempts += 1
 
   const waitedMs = Date.now() - entry.since
@@ -1798,10 +1804,13 @@ export function apply(ctx, config) {
       const key = String(agentId)
       states.delete(key)
       guardBudgets.delete(key)
-      overloadState.delete(key)
       const prefix = `${key}|`
+      // guardRetries keys are `agent|turn|step|code`; overload keys are `agent|provider`.
       for (const retryKey of guardRetries.keys()) {
         if (retryKey.startsWith(prefix)) guardRetries.delete(retryKey)
+      }
+      for (const overloadKey of overloadState.keys()) {
+        if (overloadKey.startsWith(prefix)) overloadState.delete(overloadKey)
       }
     } catch {
       /* bookkeeping only */

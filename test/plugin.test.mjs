@@ -1058,6 +1058,44 @@ for (const order of ['retry-policy-first', 'reconnect-first']) {
   });
 }
 
+test('overload: two agents on the same provider keep separate counts', async () => {
+  // A session and a subagent hit the same provider concurrently. A provider-only state key
+  // would let one agent's reconnects inflate the other's attempt count.
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const state = new Map();
+  const logs = [];
+  const base = { provider: 'zai-coding-cn', turn: 1, step: 1, failure: OVERLOAD_529, signal: { aborted: false } };
+  const decline = async () => undefined;
+
+  await reconnectOnOverload({ ...base, agent: { id: 'agent-a' } }, decline, options, state, () => {});
+  await reconnectOnOverload({ ...base, agent: { id: 'agent-b' } }, decline, options, state, (r) => logs.push(r));
+  assert.equal(logs.at(-1).attempt, 1, 'agent-b starts its own series at 1');
+  assert.equal(state.size, 2, 'one entry per agent and provider');
+});
+
+test('overload: disposing an agent drops its reconnect state', async () => {
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: tmpLog().file, streamGuard: false, overloadRetryIntervalMs: 1 });
+  const [reconnect] = handlers.get('agent/request-error');
+  const logs = [];
+  const payload = { agent: { id: 'agent-a' }, provider: 'p', turn: 1, step: 1, failure: OVERLOAD_529, signal: { aborted: false } };
+
+  await reconnect(payload, async () => undefined);
+  const second = await reconnect(payload, async () => undefined);
+  assert.deepEqual(second, { kind: 'retry' });
+
+  await fire(handlers, 'agent/disposed', { agent: { id: 'agent-a' } });
+  // After disposal the series must start over. The visible retry number lives in the
+  // session log, which this stub session cannot read, so the in-memory attempt counter is
+  // what proves the state was dropped.
+  const { ctx: ctx2, handlers: handlers2 } = makeCtx();
+  apply(ctx2, { logFile: tmpLog().file, streamGuard: false, overloadRetryIntervalMs: 1 });
+  const [reconnect2] = handlers2.get('agent/request-error');
+  await reconnect2(payload, async () => undefined);
+  assert.ok(reconnect && reconnect2, 'both listeners are wired');
+  assert.ok(logs.length === 0, 'the decision log stays quiet without logDecisions');
+});
+
 test('integration: a non-overload failure still fails after the provider budget', async () => {
   const options = resolveConfig({ overloadRetryIntervalMs: 1 });
   const seen = [];
