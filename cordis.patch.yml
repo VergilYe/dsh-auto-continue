@@ -1,6 +1,6 @@
 # dsh-auto-continue v2 — keep a turn from closing on an unfinished reply.
 #
-# Three behaviours, all optional:
+# Four behaviours, all optional:
 #   1. streamGuard — on `llm/stream`, a silent stall or a mid-thought stop becomes a
 #      retryable error, so DSH's own retry re-sends inside the same step.
 #   2. completionProtocol — injects one system-prompt section asking for an explicit
@@ -8,6 +8,11 @@
 #      real work ⇒ one short push.
 #   3. heuristic scopes (retryScope / truncationScope / extendedScope) — used when the
 #      protocol is off.
+#   4. overloadReconnect — once a provider's own bounded retry (5 attempts by default)
+#      is spent on a 429/529 "overloaded" failure (Zhipu code 1305, "访问量过大"),
+#      re-send every 10s with no ceiling instead of closing the turn as failed.
+#      Set `overloadMaxWaitMs` to cap the total wait; 0 (default) means wait as long as
+#      it takes. An aborted turn is never held open.
 #
 # No provider/model route and no credential is preset here. `allowModels` is left unset,
 # which means every route: a fresh install must work on whichever model the user runs.
@@ -29,4 +34,7 @@
         retryScope: true
         truncationScope: true
         extendedScope: true
+        overloadReconnect: true
+        overloadRetryIntervalMs: 10000
+        overloadMaxWaitMs: 0
         logDecisions: true

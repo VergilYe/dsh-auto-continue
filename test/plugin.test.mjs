@@ -10,10 +10,21 @@ import {
   guardStream,
   guardFinishChunk,
   inspectFinish,
+  classifyOverload,
+  classifyFatal,
+  reconnectOnOverload,
+  findRetryChain,
+  announceReconnect,
+  announceReconnectStarted,
+  FATAL_CODES,
   STREAM_STALL_CODE,
   STREAM_TRUNCATED_CODE,
   GUARD_CODES,
   SOURCE_KIND,
+  OVERLOAD_POLICY_PREFIX,
+  OVERLOAD_POLICY_KEY,
+  DEFAULT_OVERLOAD_CODES,
+  DEFAULT_OVERLOAD_PATTERNS,
 } from '../index.js';
 
 const ROUTE = 'open-design/deepseek-v4.1-flash';
@@ -175,19 +186,27 @@ test('apply: enabled=false installs nothing', () => {
   assert.equal(systemPrompt.sections.length, 0);
 });
 
-test('apply: maxNudges=0 behaves like not installed', () => {
+test('apply: maxNudges=0 turns the push layers off but keeps the reconnector', () => {
   const { ctx, handlers, systemPrompt } = makeCtx();
   apply(ctx, { maxNudges: 0, logFile: tmpLog().file });
+  assert.equal(systemPrompt.sections.length, 0, 'no protocol section without nudges');
+  assert.ok(!handlers.has('agent/turn-stopping'), 'no push listener without nudges');
+  assert.ok(handlers.has('agent/request-error'), 'the reconnector is a separate wish');
+});
+
+test('apply: maxNudges=0 with overloadReconnect=false installs nothing', () => {
+  const { ctx, handlers, systemPrompt } = makeCtx();
+  apply(ctx, { maxNudges: 0, overloadReconnect: false, logFile: tmpLog().file });
   assert.equal(handlers.size, 0);
   assert.equal(systemPrompt.sections.length, 0);
 });
 
-test('apply: streamGuard=false skips the guard listeners', () => {
+test('apply: streamGuard=false skips the guard listeners but keeps the reconnector', () => {
   const { ctx, handlers } = makeCtx();
   apply(ctx, { streamGuard: false, logFile: tmpLog().file });
   assert.ok(handlers.has('agent/turn-stopping'));
   assert.ok(!handlers.has('llm/stream'));
-  assert.ok(!handlers.has('agent/request-error'));
+  assert.ok(handlers.has('agent/request-error'), 'the reconnector does not depend on the stream guard');
 });
 
 // ---------------------------------------------------------------------------
@@ -617,4 +636,437 @@ test('guard wiring: request-error retries up to maxGuardRetries then delegates',
 
   const unrelated = { ...payload, failure: { code: 'QUOTA', message: 'x' } };
   assert.equal(await requestError(unrelated, next), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// overload reconnector
+// ---------------------------------------------------------------------------
+
+/** The exact gateway reply this layer was built for. */
+const OVERLOAD_529 = {
+  code: 'SERVER',
+  status: 529,
+  requestId: '2026112411431495ba06cef0884121',
+  message:
+    '529 {"type":"error","error":{"type":"overloaded_error","code":"1305","message":"[1305][该模型当前访问量过大，请您稍后再试][2026112411431495ba06cef0884121]"},"request_id":"2026112411431495ba06cef0884121"}',
+};
+
+test('overload: config defaults deliver 10s, unbounded, on', () => {
+  const options = resolveConfig({});
+  assert.equal(options.overloadReconnect, true);
+  assert.equal(options.overloadRetryIntervalMs, 10_000);
+  assert.equal(options.overloadMaxWaitMs, 0, '0 = wait forever');
+  assert.ok(options.overloadCodes.includes('RATE_LIMIT'));
+  assert.ok(DEFAULT_OVERLOAD_CODES.every((code) => options.overloadCodes.includes(code)));
+  assert.equal(options.overloadPatterns.length, DEFAULT_OVERLOAD_PATTERNS.length);
+});
+
+test('overload: config sanitizes the interval and does not resurrect bad patterns', () => {
+  assert.equal(resolveConfig({ overloadRetryIntervalMs: 0 }).overloadRetryIntervalMs, 10_000, '0 is not a poll interval');
+  assert.equal(resolveConfig({ overloadRetryIntervalMs: -5 }).overloadRetryIntervalMs, 10_000);
+  assert.equal(resolveConfig({ overloadRetryIntervalMs: 2_500 }).overloadRetryIntervalMs, 2_500);
+  assert.equal(resolveConfig({ overloadRetryIntervalMs: 1.5 }).overloadRetryIntervalMs, 10_000);
+  assert.equal(resolveConfig({ overloadPatterns: ['(unclosed'] }).overloadPatterns.length, 0);
+});
+
+test('overload: classify matches 529/1305 by status, code and message', () => {
+  const options = resolveConfig({});
+  assert.equal(classifyOverload(OVERLOAD_529, options).overload, true);
+  assert.match(classifyOverload(OVERLOAD_529, options).reason, /status:529/);
+
+  // an adapter that only forwards the text still reconnects
+  assert.equal(classifyOverload({ code: 'SERVER', message: OVERLOAD_529.message }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'SERVER', message: 'overloaded_error' }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'SERVER', message: '[1305]' }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'UNKNOWN', message: '该模型当前访问量过大，请您稍后再试' }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'RATE_LIMIT', message: '' }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'HTTP_429', message: '' }, options).overload, true);
+  assert.equal(classifyOverload({ code: 'SERVER', status: 429 }, options).overload, true);
+});
+
+test('overload: classify leaves real errors alone', () => {
+  const options = resolveConfig({});
+  // a plain 5xx is NOT retried forever: a broken gateway would never come back
+  assert.equal(classifyOverload({ code: 'SERVER', status: 500, message: 'bad gateway' }, options).overload, false);
+  assert.equal(classifyOverload({ code: 'AUTH', message: 'invalid api key' }, options).overload, false);
+  assert.equal(classifyOverload({ code: 'QUOTA', message: 'balance exhausted' }, options).overload, false);
+  assert.equal(classifyOverload({ code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too long' }, options).overload, false);
+  assert.equal(classifyOverload(undefined, options).overload, false);
+});
+
+test('overload: a terminal condition outranks an outage signal', () => {
+  const options = resolveConfig({});
+  // The trap this guard exists for: an exhausted balance phrased as "rate limit", and a
+  // 429 whose body is really "quota exceeded". Waiting would never fix either.
+  assert.equal(classifyOverload({ code: 'QUOTA', status: 429, message: 'rate limit exceeded' }, options).overload, false);
+  assert.equal(classifyOverload({ code: 'RATE_LIMIT', message: 'insufficient quota' }, options).overload, false);
+  assert.equal(classifyOverload({ status: 529, message: '账户余额不足，请充值' }, options).overload, false);
+  assert.equal(classifyOverload({ status: 429, message: 'usage limit reached' }, options).overload, false);
+  assert.equal(classifyOverload({ code: 'AUTH', status: 429, message: '429' }, options).overload, false);
+  assert.match(classifyOverload({ code: 'QUOTA', message: 'x' }, options).reason, /^fatal:/);
+});
+
+test('overload: classifyFatal names the terminal codes and wordings', () => {
+  assert.equal(classifyFatal({ code: 'QUOTA' }), 'code:QUOTA');
+  assert.equal(classifyFatal({ code: 'AUTH' }), 'code:AUTH');
+  assert.equal(classifyFatal({ code: 'SERVER', message: 'insufficient balance' }), 'message:\\binsufficient[\\s_-]+(?:quota|balance|credits?)\\b');
+  assert.equal(classifyFatal({ code: 'SERVER', message: 'model context window exceeded' }), 'message:context[\\s_-](?:length|window)[\\s_-](?:exceeded|overflow)');
+  assert.equal(classifyFatal({ code: 'SERVER', message: 'overloaded' }), undefined);
+  assert.equal(classifyFatal(undefined), undefined);
+  assert.ok(FATAL_CODES.includes('QUOTA'));
+  assert.ok(FATAL_CODES.includes('CONTEXT_WINDOW_EXCEEDED'));
+});
+
+test('overload: a non-overload failure is delegated untouched', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const logs = [];
+  let downstream = 0;
+  const result = await reconnectOnOverload(
+    { provider: 'zai-coding-cn', turn: 1, step: 1, failure: { code: 'AUTH', message: 'nope' } },
+    async () => { downstream += 1; return undefined; },
+    options,
+    new Map(),
+    (record) => logs.push(record),
+  );
+  assert.equal(result, undefined);
+  assert.equal(downstream, 1);
+  assert.equal(logs.length, 0, 'not this layer\'s business');
+});
+
+test('overload: the provider budget is spent before the reconnect starts', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const logs = [];
+  let downstream = 0;
+  // The bounded policy still has attempts left: it answers {kind:'retry'}, and this layer
+  // must pass that straight through instead of adding a second, unbounded series.
+  const result = await reconnectOnOverload(
+    { provider: 'zai-coding-cn', turn: 1, step: 1, failure: OVERLOAD_529 },
+    async () => { downstream += 1; return { kind: 'retry' }; },
+    options,
+    new Map(),
+    (record) => logs.push(record),
+  );
+  assert.deepEqual(result, { kind: 'retry' });
+  assert.equal(downstream, 1);
+  assert.equal(logs.length, 0, 'no reconnect log while the normal policy is still working');
+});
+
+test('overload: after the provider declines, every attempt reconnects', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const logs = [];
+  const state = new Map();
+  const payload = { provider: 'zai-coding-cn', turn: 1, step: 1, failure: OVERLOAD_529, signal: { aborted: false } };
+  const decline = async () => undefined;
+
+  for (let i = 1; i <= 20; i += 1) {
+    const action = await reconnectOnOverload(payload, decline, options, state, (record) => logs.push(record));
+    assert.deepEqual(action, { kind: 'retry' }, `attempt ${i} must keep retrying, with no ceiling`);
+  }
+  const reconnects = logs.filter((record) => record.action === 'reconnect');
+  assert.equal(reconnects.length, 20);
+  assert.equal(reconnects.at(-1).attempt, 20);
+  assert.equal(reconnects.at(-1).intervalMs, 1);
+  assert.equal(reconnects.at(-1).match, 'status:529');
+  assert.equal(reconnects.at(-1).requestId, '2026112411431495ba06cef0884121');
+});
+
+test('overload: the wait is spaced by the configured interval, not run hot', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 60 });
+  const state = new Map();
+  const payload = { provider: 'p', turn: 1, step: 1, failure: { code: 'RATE_LIMIT', message: '' } };
+  const started = Date.now();
+  await reconnectOnOverload(payload, async () => undefined, options, state, () => {});
+  await reconnectOnOverload(payload, async () => undefined, options, state, () => {});
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 110, `two waits of 60ms must not be free (elapsed=${elapsed}ms)`);
+});
+
+test('overload: the reconnect series resets when the step advances', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const state = new Map();
+  const logs = [];
+  const decline = async () => undefined;
+  const at = (step) => ({ provider: 'p', turn: 1, step, failure: { code: 'RATE_LIMIT' } });
+
+  await reconnectOnOverload(at(1), decline, options, state, (r) => logs.push(r));
+  await reconnectOnOverload(at(1), decline, options, state, (r) => logs.push(r));
+  await reconnectOnOverload(at(2), decline, options, state, (r) => logs.push(r));
+  assert.deepEqual(logs.map((record) => record.attempt), [1, 2, 1], 'a new step means the previous series recovered');
+});
+
+test('overload: an aborted turn is never held open', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const logs = [];
+  const result = await reconnectOnOverload(
+    { provider: 'p', turn: 1, step: 1, failure: OVERLOAD_529, signal: { aborted: true } },
+    async () => undefined,
+    options,
+    new Map(),
+    (r) => logs.push(r),
+  );
+  assert.equal(result, undefined, 'the user cancelled; give the failure back');
+  assert.equal(logs[0].reason, 'turn-aborted');
+});
+
+test('overload: a wait cancelled mid-flight stops reconnecting', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 5_000 });
+  const controller = new AbortController();
+  const logs = [];
+  setTimeout(() => controller.abort(), 20);
+  const started = Date.now();
+  const result = await reconnectOnOverload(
+    { provider: 'p', turn: 1, step: 1, failure: OVERLOAD_529, signal: controller.signal },
+    async () => undefined,
+    options,
+    new Map(),
+    (r) => logs.push(r),
+  );
+  const elapsed = Date.now() - started;
+  assert.equal(result, undefined);
+  assert.ok(elapsed < 1_000, `an abort must cut the 5s wait short (elapsed=${elapsed}ms)`);
+  assert.ok(logs.some((record) => record.reason === 'wait-cancelled'));
+});
+
+test('overload: an optional wait budget lets the caller cap the wait', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1, overloadMaxWaitMs: 40 });
+  const logs = [];
+  const state = new Map();
+  const payload = { provider: 'p', turn: 1, step: 1, failure: OVERLOAD_529 };
+  const decline = async () => undefined;
+
+  let sawDelegate = false;
+  for (let i = 0; i < 200 && !sawDelegate; i += 1) {
+    const action = await reconnectOnOverload(payload, decline, options, state, (r) => logs.push(r));
+    if (action === undefined) sawDelegate = true;
+    else await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.ok(sawDelegate, 'the budget must eventually hand the failure back');
+  assert.ok(logs.some((record) => record.reason === 'wait-budget-exhausted'));
+});
+
+test('overload wiring: the reconnector is installed even when the push layers are off', () => {
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { maxNudges: 0, streamGuard: false, logFile: tmpLog().file });
+  const listeners = handlers.get('agent/request-error') ?? [];
+  assert.equal(listeners.length, 1);
+  assert.ok(!handlers.has('agent/turn-stopping'));
+});
+
+test('overload wiring: it acts when the guard declines, and logs the facts', async () => {
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { streamGuard: false, logFile: log.file, logDecisions: true, overloadRetryIntervalMs: 1 });
+  const [reconnect] = handlers.get('agent/request-error');
+
+  const action = await reconnect(
+    { agent: { id: 'a' }, provider: 'zai-coding-cn', turn: 2, step: 3, failure: OVERLOAD_529, signal: { aborted: false } },
+    async () => undefined,
+  );
+  assert.deepEqual(action, { kind: 'retry' });
+
+  const record = readLines(log.file).find((line) => line.event === 'overload');
+  assert.ok(record, 'the reconnect must be observable in the plugin log');
+  assert.equal(record.provider, 'zai-coding-cn');
+  assert.equal(record.turn, 2);
+  assert.equal(record.code, 'SERVER');
+  assert.equal(record.status, 529);
+});
+
+test('overload wiring: the guarded configuration keeps both request-error listeners', () => {
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: tmpLog().file, overloadRetryIntervalMs: 1 });
+  const listeners = handlers.get('agent/request-error') ?? [];
+  assert.equal(listeners.length, 2, 'the truncation guard and the reconnector are separate layers');
+});
+
+// ---------------------------------------------------------------------------
+// reconnect visibility
+// ---------------------------------------------------------------------------
+
+/** A session that records appends, for asserting what the conversation will show. */
+function recordingSession(events = []) {
+  const session = makeSession(events);
+  const appended = [];
+  session.append = (type, data) => {
+    appended.push({ type, data });
+    return appended.length - 1;
+  };
+  session.appended = appended;
+  return session;
+}
+
+const retryRecord = (seq, { turn = 1, step = 3, retryId = 'rid-1', policyKey = 'k', retry = 5 } = {}) => ({
+  type: 'llm/retry',
+  seq,
+  time: 0,
+  data: {
+    retryId,
+    turn,
+    step,
+    provider: 'zai-coding-cn',
+    mode: policyKey === OVERLOAD_POLICY_KEY ? 'always' : 'normal',
+    policyKey,
+    retry,
+    delayMs: 100,
+    failure: { code: 'SERVER', message: 'x' },
+  },
+});
+
+test('visibility: findRetryChain continues the provider chain and counts our own records', () => {
+  const events = [
+    turnStart(1),
+    retryRecord(2, { retry: 5 }),
+    retryRecord(3, { policyKey: OVERLOAD_POLICY_KEY, retry: 6 }),
+    retryRecord(4, { policyKey: OVERLOAD_POLICY_KEY, retry: 7 }),
+  ];
+  const chain = findRetryChain(makeSession(events), 1, 3);
+  assert.equal(chain.retryId, 'rid-1', 'the provider chain owns the id');
+  assert.equal(chain.baseRetry, 5, 'the bounded policy got to 5');
+  assert.equal(chain.ours, 2, 'two reconnect records already exist');
+});
+
+test('visibility: another step\'s chain is not picked up', () => {
+  const events = [turnStart(1), retryRecord(2, { step: 1, retry: 3 })];
+  const chain = findRetryChain(makeSession(events), 1, 2);
+  assert.equal(chain.retryId, undefined);
+  assert.equal(chain.baseRetry, 0);
+});
+
+test('visibility: a reconnect is recorded as a durable llm/retry event', () => {
+  const session = recordingSession();
+  const payload = { agent: { id: 'a', session }, provider: 'zai-coding-cn', turn: 1, step: 2 };
+  const failure = { code: 'SERVER', status: 529, message: 'overloaded' };
+
+  const announced = announceReconnect(payload, { retryId: 'rid-9', retry: 6, delayMs: 10_000 }, failure);
+  assert.equal(announced, true);
+  assert.equal(session.appended.length, 1);
+  const [record] = session.appended;
+  assert.equal(record.type, 'llm/retry');
+  assert.equal(record.data.retryId, 'rid-9');
+  assert.equal(record.data.turn, 1);
+  assert.equal(record.data.step, 2);
+  assert.equal(record.data.provider, 'zai-coding-cn');
+  assert.equal(record.data.mode, 'always', 'unbounded: the chat row shows ∞');
+  assert.equal(record.data.retry, 6);
+  assert.equal(record.data.delayMs, 10_000);
+  assert.equal(record.data.policyKey, OVERLOAD_POLICY_KEY);
+  assert.deepEqual(record.data.failure, failure);
+});
+
+test('visibility: llm/retry-started closes the record after the wait', () => {
+  const session = recordingSession();
+  announceReconnectStarted({ agent: { id: 'a', session }, provider: 'p', turn: 4, step: 2 }, { retryId: 'rid-9', retry: 7 });
+  assert.deepEqual(session.appended[0], {
+    type: 'llm/retry-started',
+    data: { retryId: 'rid-9', turn: 4, step: 2, retry: 7 },
+  });
+});
+
+test('visibility: a session that refuses the record cannot stop the reconnect', async () => {
+  const session = makeSession([]);
+  session.append = () => { throw new Error('session closed'); };
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const logs = [];
+  const action = await reconnectOnOverload(
+    { agent: { id: 'a', session }, provider: 'zai-coding-cn', turn: 1, step: 1, failure: OVERLOAD_529, signal: { aborted: false } },
+    async () => undefined,
+    options,
+    new Map(),
+    (r) => logs.push(r),
+  );
+  assert.deepEqual(action, { kind: 'retry' }, 'the wait still happens');
+  assert.equal(logs.find((record) => record.action === 'reconnect').announced, false);
+});
+
+test('visibility: without a readable log the number still climbs', async () => {
+  // A session that cannot report `eventAt` must not pin every record at retry 1.
+  const session = recordingSession();
+  session.eventAt = undefined;
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const payload = { agent: { id: 'a', session }, provider: 'p', turn: 1, step: 1, failure: OVERLOAD_529 };
+  const state = new Map();
+
+  for (let i = 0; i < 3; i += 1) {
+    await reconnectOnOverload(payload, async () => undefined, options, state, () => {});
+  }
+  const numbers = session.appended.filter((r) => r.type === 'llm/retry').map((r) => r.data.retry);
+  assert.deepEqual(numbers, [1, 2, 3], 'the visible count must keep increasing');
+});
+
+test('visibility: the reconnect row numbers itself after the provider attempts', async () => {
+  const session = recordingSession([turnStart(1), retryRecord(2, { step: 1, retry: 5 })]);
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const payload = { agent: { id: 'a', session }, provider: 'zai-coding-cn', turn: 1, step: 1, failure: OVERLOAD_529 };
+
+  await reconnectOnOverload(payload, async () => undefined, options, new Map(), () => {});
+  const records = session.appended.filter((record) => record.type === 'llm/retry');
+  assert.equal(records.length, 1);
+  assert.equal(records[0].data.retryId, 'rid-1', 'the existing chain is continued, not replaced');
+  assert.equal(records[0].data.retry, 6, 'numbered right after the provider\'s fifth attempt');
+});
+
+// ---------------------------------------------------------------------------
+// end-to-end against a waterfall shaped like the real event
+// ---------------------------------------------------------------------------
+
+/** A cordis-style waterfall: the first registered listener is outermost. */
+function waterfall(listeners, payload) {
+  const run = (index) => {
+    if (index >= listeners.length) return Promise.resolve(undefined);
+    return listeners[index](payload, () => run(index + 1));
+  };
+  return run(0);
+}
+
+/** A stand-in for `dsh-llm-retry` with a bounded budget, mirroring its real logic. */
+function boundedRetryPolicy(maxRetries, seen) {
+  let count = 0;
+  return async (_payload, next) => {
+    if (count >= maxRetries) return next();
+    count += 1;
+    seen.push(count);
+    return { kind: 'retry' };
+  };
+}
+
+for (const order of ['retry-policy-first', 'reconnect-first']) {
+  test(`integration: 5 provider retries then unbounded reconnects (${order})`, async () => {
+    const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+    const state = new Map();
+    const seen = [];
+    const retryPolicy = boundedRetryPolicy(5, seen);
+    const reconnect = (payload, next) => reconnectOnOverload(payload, next, options, state, () => {});
+    const listeners = order === 'retry-policy-first' ? [retryPolicy, reconnect] : [reconnect, retryPolicy];
+
+    const outage = 35;
+    const results = [];
+    for (let i = 0; i < outage; i += 1) {
+      results.push(await waterfall(listeners, {
+        agent: { id: 'a' },
+        provider: 'zai-coding-cn',
+        turn: 1,
+        step: 1,
+        failure: OVERLOAD_529,
+        signal: { aborted: false, addEventListener() {}, removeEventListener() {} },
+      }));
+    }
+
+    assert.equal(results.filter((action) => action?.kind === 'retry').length, outage, 'no ceiling');
+    assert.deepEqual(seen, [1, 2, 3, 4, 5], 'the bounded policy still owned its 5 attempts');
+    const reconnects = [...state.values()].reduce((sum, entry) => sum + entry.attempts, 0);
+    assert.equal(reconnects, outage - 5, 'everything past the budget belongs to the reconnector');
+  });
+}
+
+test('integration: a non-overload failure still fails after the provider budget', async () => {
+  const options = resolveConfig({ overloadRetryIntervalMs: 1 });
+  const seen = [];
+  const listeners = [boundedRetryPolicy(5, seen), (payload, next) => reconnectOnOverload(payload, next, options, new Map(), () => {})];
+  const fail = { code: 'AUTH', message: 'invalid api key' };
+
+  for (let i = 0; i < 5; i += 1) {
+    assert.deepEqual(await waterfall(listeners, { provider: 'p', turn: 1, step: 1, failure: fail }), { kind: 'retry' });
+  }
+  assert.equal(await waterfall(listeners, { provider: 'p', turn: 1, step: 1, failure: fail }), undefined,
+    'after the budget, a credential error is still terminal');
 });

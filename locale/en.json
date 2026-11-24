@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Auto Continue",
-    "description": "Turns a silently truncated or half-finished model stream into a retry, and asks the model to declare how each turn ended, so a turn no longer closes on a plan."
+    "description": "Turns a silently truncated or half-finished model stream into a retry, asks the model to declare how each turn ended, and — once a provider's own retries are spent on a 429/529 overload (including GLM code 1305) — reconnects every 10 seconds with no ceiling instead of failing the turn."
   }
 }

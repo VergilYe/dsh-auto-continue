@@ -1,6 +1,9 @@
 # dsh-auto-continue v2
 
-重写版。目标只有一个：**轮次不能在「话没说完」或「只写了下一步计划」的时候关闭。**
+重写版。目标有两个：
+
+1. **轮次不能在「话没说完」或「只写了下一步计划」的时候关闭。**
+2. **上游过载（429 / 529-1305）时不能把这一轮判死。** DSH 自带重试 5 次用尽后，本插件继续每 10 秒重连，直到连上或你手动中断。
 
 ## 为什么重写
 
@@ -13,7 +16,53 @@ v1 能用，但踩了六个坑，v2 把它们写成设计约束：
 5. **`maxNudges` 必须从持久日志推导**。取本 turn 里已有几条 `source.kind = auto-continue` 的 user/message，这样多实例、重载、重启都封得住。
 6. **损坏流的清理不能 await**。上游卡死时，`await iterator.return()` 会把重试一起卡住。v2 改成事后触发、不等待。
 
-## 三层防护
+## 四层防护
+
+### 0. 请求恢复层：过载无限重连（`overloadReconnect`）
+
+专治这一种报错：
+
+```
+本轮运行失败529 {"type":"error","error":{"type":"overloaded_error","code":"1305",
+  "message":"[1305][该模型当前访问量过大，请您稍后再试][…]"},"request_id":"…"}
+```
+
+DSH 本身有重试策略（`dsh-llm-retry`，默认 `maxRetries: 5`），但 5 次用尽后 loop 会抛错、
+UI 显示「本轮运行失败」并结束这一轮。本层接在它**后面**：5 次全失败后不再判死，改为每
+`overloadRetryIntervalMs`（默认 10 秒）重发同一请求，**没有次数上限**。
+
+```
+agent/request-error
+   ├─ llm-retry（正常策略，5 次）      → {kind:'retry'}
+   └─ 拒绝后 → auto-continue 重连层     → 每 10s 一次 {kind:'retry'}，无上限
+                    ↓
+              连上 → 正常继续；signal.aborted → 立刻放手
+```
+
+- **顺序无关**：本层总是先 `await next()`，下游策略给出的 `{kind:'retry'}` 原样透传。所以
+  `llm-retry` 无论在本插件之上还是之下，它那 5 次都一定先跑完。
+- **匹配三重判据**：`failure.status === 429/529`、`failure.code ∈ overloadCodes`
+  （`RATE_LIMIT`/`OVERLOADED`/`HTTP_429`/`HTTP_529`）、或 `failure.message` 命中
+  `overloadPatterns`（`\b529\b`、`\b429\b`、`overloaded`、`\b1305\b`、`访问量过大`、
+  `稍后再试`、`请求过于频繁`、`too many requests`、`rate.?limit`）。只要有一条命中就重连。
+  这是必需的：`dsh-llm-pi-ai` 把 529 归成 `SERVER`，光看 code 分不出「过载」和「网关坏了」。
+- **`SERVER` 默认不在 `overloadCodes` 里**：普通 5xx（500/502/504）是另一种故障，无限重连
+  只会把人卡死。要靠 `SERVER` 覆盖 529，请确认整条路由的 5xx 都是限流，再显式加进配置。
+- **真的 429/529 仍会被救到**：即使 code 是 `SERVER`，message 里的 `529` / `1305` /
+  `overloaded_error` 也命中了文本判据。
+- **终态故障优先于重连**：`AUTH` / `QUOTA` / `CONTEXT_WINDOW_EXCEEDED` / `INVALID_REQUEST`
+  这类无论等多久都不会好的失败**一律不接管**，哪怕它带 429 状态或写着 "rate limit"。
+  这条闸口必须比重连判据先跑——「余额不足」常被写成 rate limit 措辞，如果被当成过载去
+  无限等，只会每 10 秒空烧一次会话，把用户唯一该修的那件事藏起来。
+- **可中断**：等待期间 `signal` 一 abort 就立刻收手（返回 `undefined`，把失败交回 loop）。
+  用户点停止不会被 10 秒一次的循环拖住。
+- **等待有上限可选**：`overloadMaxWaitMs` 默认 `0` = 无限等；设成正数则在累计等待超过该
+  毫秒数后放手，交回 loop 结束这一轮。
+- **进度可见**：每次重连都会往会话里写一条和 `dsh-llm-retry` 同形的 `llm/retry`
+  事件（`mode: 'always'`），聊天里显示的是「重试 n/∞」倒计时，不是看起来卡死的转圈。
+  `llm/retry-started` 在等待结束后补写。
+- **计数从持久日志推导**：沿用 provider 自己的 `retryId`，尝试号接在它 5 次之后（6、7、8…），
+  插件重载或 mid-turn 重启都不会从 1 重新数。
 
 ### 1. 请求层：`llm/stream` guard
 
@@ -85,6 +134,11 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 | `streamGuard` | `true` | 请求层防护 |
 | `streamIdleMs` | `90000` | 流内静默多久判卡死（本机适配器自身超时 300s） |
 | `maxGuardRetries` | `1` | 截断改判上限 / 每 step guard 重试上限 |
+| `overloadReconnect` | `true` | 过载无限重连层（429/529-1305）；`false` 时行为回到纯 v2 |
+| `overloadRetryIntervalMs` | `10000` | 每次重连的间隔；`0`/负值/非整数会被忽略并退回 10000 |
+| `overloadMaxWaitMs` | `0` | 累计等待上限；`0` = 无限等 |
+| `overloadCodes` | RATE_LIMIT/OVERLOADED/HTTP_429/HTTP_529 | 直接算过载的 `failure.code` |
+| `overloadPatterns` | 见代码 | 从 `failure.message` 识别过载的正则源串 |
 | `retryScope` / `truncationScope` / `extendedScope` | `true` | 兜底三域 |
 | `retryCodes` | TRANSPORT/TIMEOUT/SERVER | 算「供应商侧故障」的码 |
 | `allowModels` | `[]` | 生效路由；默认空数组 = 全部路由，收窄时填 `provider/model` 列表 |
@@ -104,6 +158,9 @@ adapter 流 → guardStream → 逐 chunk 透传（UI 照常实时输出）
 8. `signal.aborted` / `agent.status !== 'running'` / 非白名单路由不推。
 9. 监听器内所有异常吞掉并记日志，绝不冒泡到主循环。
 10. 截断改判与 guard 重试都有上限，`maxGuardRetries` 用尽后放行。
+11. **过载重连没有次数上限，但有三个刹车**：`signal.aborted` 一 abort 立刻放手；可选的 `overloadMaxWaitMs` 总时长上限；非过载失败（AUTH/QUOTA/上下文超限/普通 5xx）一律不接管，交回 loop 正常判死。等待用可中断睡眠，不会留悬挂的定时器或监听器。
+12. 过载重连与推送额度**完全解耦**：`maxNudges=0` 只关掉「推它继续」，重连仍然生效；`enabled=false` 才全部关闭。
+13. 终态故障（`FATAL_CODES` + `FATAL_PATTERNS`）在重连判据**之前**短路：欠费、无效凭据、上下文超限这类不会自愈的失败永远不进入无限重连。
 
 ## 验证
 
@@ -112,7 +169,7 @@ cd plugins/dsh-auto-continue
 npm test        # = node --test "test/*.test.mjs"
 ```
 
-当前：**63 tests / 63 pass**。覆盖配置解析、标记解析（四种样式，含「块不在末尾不算声明」与其语法残留取舍）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判 / 默认全路由 vs 显式白名单）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次且留 `giveup` 事件、有推进的推送不吃额度、长回合无总次数上限）、以及 stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/辅助请求放行与白名单收窄。
+当前：**90 tests / 90 pass**。覆盖配置解析、标记解析（四种样式，含「块不在末尾不算声明」与其语法残留取舍）、剥离、`isSettled`、决策正反例（缺声明必推 / 正文为空必推 / 协议关闭时维持原判 / 默认全路由 vs 显式白名单）、`foldTurn` 记账（含“有推进的推送不算欠账”）、`stateFor` 清零、`apply` 装配（含 section 清理函数注册）、监听器安全（注入抛错、放弃提示只发一次且留 `giveup` 事件、有推进的推送不吃额度、长回合无总次数上限）、stream guard 的透传/截断/卡死/无 finish/上游抛错/预算耗尽/辅助请求放行与白名单收窄，以及过载重连层（529/1305 三重判据、终态故障短路、普通 5xx 不接管、provider 额度先跑完、无上限重连、10s 间隔、abort 立刻收手、可选总时长上限、step 推进后清零、持久 `llm/retry` 可见记录与续号，加上「两种瀑布顺序下都是先 5 次后无限」的端到端用例）。
 
 ## 已知限制
 
@@ -121,6 +178,8 @@ npm test        # = node --test "test/*.test.mjs"
 - **不记录 `stopReason` 的路由不可判**（如 `deepseek-account/deepseek-flash`）：判据要求 `stop`，取不到就静默跳过。
 - **协议层依赖宿主提供 `systemPrompt` 服务**：某些上下文里该服务不存在，协议段会静默缺失（日志留一条 `no system-prompt service is mounted`），此时只剩请求层 guard 与兜底三域。
 - **依赖 `Session.eventAt` / `snapshotEvents`**：两者已被标 `@deprecated`，未来移除会让窗口读取返回 `undefined`（只记 skip，不推，不会崩）。
+- **过载重连依赖宿主的 `agent/request-error` 瀑布**：只要 `dsh-llm-retry` 或本插件有一个挂上就有救；如果宿主把这层去掉，无限重连无处挂载。
+- **重连期间不改变请求内容**：它只重发同一个请求。如果过载源于请求本身太大（上下文顶到上限），重连不会自愈——那是另一种故障，应当由压缩/上下文超限上报。
 
 ## 安装 / 卸载
 

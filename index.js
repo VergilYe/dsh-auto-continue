@@ -18,13 +18,17 @@
  * 6. Cleanup of a damaged stream must never be awaited: a provider that hangs would
  *    hold the retry hostage for exactly as long as it hangs.
  *
- * Three layers, cheapest first:
+ * Four layers, cheapest first:
  *   - `llm/stream` guard: a stream that stops mid-thought or goes silent becomes a
  *     terminal `error`, so DSH's own retry re-sends inside the same step.
  *   - completion protocol: an injected system-prompt section asks for an explicit
  *     end-of-reply declaration. Declared ⇒ close; missing after real work ⇒ push.
  *   - heuristic scopes: reconnect / unsettled text / plan phrasing, for when the
  *     protocol is off.
+ *   - overload reconnector: once a provider's own retry budget is spent on a
+ *     429/529 ("overloaded", "访问量过大", code 1305) failure, keep re-sending every
+ *     `overloadRetryIntervalMs` until it connects or the turn is aborted, instead of
+ *     closing the turn as failed.
  *
  * Zero runtime dependencies: only `node:` builtins.
  *
@@ -120,6 +124,42 @@ export const DEFAULT_ALLOW_MODELS = Object.freeze([])
 /** Provider failure codes that mean "the answer was cut". */
 export const DEFAULT_RETRY_CODES = Object.freeze(['TRANSPORT', 'TIMEOUT', 'SERVER'])
 
+/**
+ * Failure codes that mean "the provider is overloaded right now", which is the one shape
+ * worth waiting out indefinitely: the request is valid, the model exists, and nothing in
+ * the conversation needs to change — only the minute does.
+ *
+ * `SERVER` is deliberately absent: it covers every `5xx`, including a genuine gateway
+ * fault that would keep failing forever. The 529 case is still reached, because
+ * `dsh-llm-pi-ai` forwards the gateway body verbatim and the message patterns below match
+ * its `529` / `1305` / `overloaded_error` wording. Add `SERVER` here only if every 5xx on
+ * the route really is a load shed.
+ */
+export const DEFAULT_OVERLOAD_CODES = Object.freeze([
+  'RATE_LIMIT',
+  'OVERLOADED',
+  'HTTP_429',
+  'HTTP_529',
+])
+
+/**
+ * Status text that identifies an overloaded provider when the adapter only forwards a
+ * message. Matched case-insensitively against `failure.message`; the gateway's Chinese
+ * wording ("该模型当前访问量过大，请您稍后再试") and Zhipu's `1305` both appear here.
+ */
+export const DEFAULT_OVERLOAD_PATTERNS = Object.freeze([
+  '\\b529\\b',
+  '\\b429\\b',
+  'overloaded',
+  '\\b1305\\b',
+  '访问量过大',
+  '稍后再试',
+  '请求过于频繁',
+  'too many requests',
+  'rate.?limit',
+])
+
+
 const FENCE = '`'.repeat(3)
 
 /**
@@ -175,6 +215,12 @@ export const DEFAULTS = Object.freeze({
   maxGuardRetries: 1,
   completionProtocol: true,
   markerStyle: 'fence-check',
+  overloadReconnect: true,
+  overloadRetryIntervalMs: 10_000,
+  overloadMaxWaitMs: 0,
+  overloadCodes: [...DEFAULT_OVERLOAD_CODES],
+  overloadPatterns: [...DEFAULT_OVERLOAD_PATTERNS],
+
   protocolNudgeText:
     '继续。若还有没做完的事就直接做完；完成时用 done 代码块收尾，需要我拍板时用 ask 代码块。',
   giveUpNoticeText:
@@ -292,6 +338,18 @@ export function resolveConfig(raw) {
     retryCodes: Array.isArray(input.retryCodes)
       ? input.retryCodes.filter((entry) => typeof entry === 'string' && entry.length > 0)
       : [...DEFAULT_RETRY_CODES],
+    overloadReconnect: bool(input.overloadReconnect, DEFAULTS.overloadReconnect),
+    overloadRetryIntervalMs:
+      isCount(input.overloadRetryIntervalMs) && input.overloadRetryIntervalMs > 0
+        ? input.overloadRetryIntervalMs
+        : DEFAULTS.overloadRetryIntervalMs,
+    overloadMaxWaitMs: isCount(input.overloadMaxWaitMs)
+      ? input.overloadMaxWaitMs
+      : DEFAULTS.overloadMaxWaitMs,
+    overloadCodes: Array.isArray(input.overloadCodes)
+      ? input.overloadCodes.filter((entry) => typeof entry === 'string' && entry.length > 0)
+      : [...DEFAULT_OVERLOAD_CODES],
+    overloadPatterns: compilePatterns(input.overloadPatterns, DEFAULT_OVERLOAD_PATTERNS).regexes,
     logDecisions: bool(input.logDecisions, DEFAULTS.logDecisions),
     logFile: typeof input.logFile === 'string' ? input.logFile : DEFAULTS.logFile,
     planPatterns: plan.regexes,
@@ -1077,6 +1135,323 @@ export async function* guardStream(upstream, context) {
 }
 
 // ---------------------------------------------------------------------------
+// overload reconnect
+// ---------------------------------------------------------------------------
+
+/**
+ * Failures that must never be treated as overload, whatever their status or wording.
+ *
+ * An outage is waited out because the next attempt can plausibly succeed. These cannot: a
+ * revoked key, an exhausted balance, or a request that is too large for the model fails
+ * identically forever, so an unbounded reconnector would burn every 10 seconds for the rest
+ * of the session instead of surfacing the one thing the user has to fix.
+ *
+ * The check runs **before** the overload match because provider wording overlaps: an
+ * exhausted-quota message is routinely phrased with "rate limit", and a 429 can just as
+ * easily carry "quota exceeded".
+ */
+export const FATAL_CODES = Object.freeze([
+  'AUTH',
+  'INVALID_CREDENTIAL',
+  'MISSING_CREDENTIAL',
+  'NO_CREDENTIAL_STORE',
+  'QUOTA',
+  'ACCOUNT_QUOTA',
+  'ACCOUNT_TOKEN_INVALID',
+  'ACCOUNT_SIGN_IN_REQUIRED',
+  'CONTEXT_WINDOW_EXCEEDED',
+  'INVALID_REQUEST',
+  'MODEL_UNSUPPORTED',
+  'UNKNOWN_MODEL',
+  'INVALID_MODEL_CONTEXT',
+  'UNSUPPORTED_REASONING_EFFORT',
+  'UNSUPPORTED_OPTION',
+])
+
+/** Provider wording that means a terminal condition rather than a load shed. */
+export const FATAL_PATTERNS = Object.freeze([
+  /\binsufficient[\s_-]+(?:quota|balance|credits?)\b/i,
+  /\b(?:quota|usage[\s_-]+limit)[\s_-]+(?:exceeded|exhausted|reached)\b/i,
+  /\b(?:balance|credits?)[\s_-]+(?:exhausted|depleted)\b/i,
+  /\bout[\s_-]+of[\s_-]+(?:credits?|budget)\b/i,
+  /\binvalid[\s_-]+(?:api[\s_-]?key|token|credential)\b/i,
+  /余额不足|额度(?:不足|已用尽|耗尽)|欠费|请充值|重新登录/i,
+  /context[\s_-](?:length|window)[\s_-](?:exceeded|overflow)/i,
+  /maximum\s+context\s+(?:length|window)/i,
+])
+
+/**
+ * @param {{ code?: unknown, message?: unknown }} failure - the request failure.
+ * @returns {string | undefined} the fatal reason, or undefined when it is not fatal.
+ */
+export function classifyFatal(failure) {
+  const code = typeof failure?.code === 'string' ? failure.code : ''
+  if (code.length > 0 && FATAL_CODES.includes(code)) return `code:${code}`
+  const message = typeof failure?.message === 'string' ? failure.message : ''
+  if (message.length === 0) return undefined
+  for (const pattern of FATAL_PATTERNS) {
+    if (pattern.test(message)) return `message:${pattern.source}`
+  }
+  return undefined
+}
+
+/**
+ * Whether one provider failure is the "come back in a minute" shape — the only kind this
+ * plugin reconnects without a ceiling.
+ *
+ * Two independent signals are accepted, because the code an adapter reports and the text
+ * the gateway sent do not always line up: `dsh-llm-pi-ai` maps every `5xx` to `SERVER`,
+ * so its code alone cannot distinguish a load-shed 529 from a broken gateway, while the
+ * message still carries `529` / `1305` / `overloaded_error`.
+ *
+ * @param {{ code?: unknown, status?: unknown, message?: unknown }} failure - the
+ *   `agent/request-error` failure.
+ * @param {object} options - resolved config.
+ * @returns {{ overload: boolean, reason: string }}
+ */
+export function classifyOverload(failure, options) {
+  if (failure === undefined || failure === null) return { overload: false, reason: 'no-failure' }
+
+  // A terminal condition outranks every "try again later" signal, including a 429 status:
+  // waiting does not refill a balance or shrink an oversized request.
+  const fatal = classifyFatal(failure)
+  if (fatal !== undefined) return { overload: false, reason: `fatal:${fatal}` }
+
+  const code = typeof failure.code === 'string' ? failure.code : ''
+  const status = typeof failure.status === 'number' ? failure.status : undefined
+  const message = typeof failure.message === 'string' ? failure.message : ''
+
+  // A status the adapter managed to carry is the strongest signal there is.
+  if (status === 429 || status === 529) return { overload: true, reason: `status:${status}` }
+  if (code.length > 0 && options.overloadCodes.includes(code)) {
+    return { overload: true, reason: `code:${code}` }
+  }
+  if (message.length > 0) {
+    for (const pattern of options.overloadPatterns) {
+      if (pattern.test(message)) return { overload: true, reason: `message:${pattern.source}` }
+    }
+  }
+  return { overload: false, reason: `code:${code || 'unknown'}` }
+}
+
+/**
+ * Policy-key prefix that marks a durable `llm/retry` record as this plugin's own.
+ * `dsh-llm-retry` keys its projection state by `provider` + `policyKey`, so a distinct
+ * prefix keeps our unbounded series from being mistaken for (or counted against) the
+ * provider's bounded one. The prefix is deliberately independent of the configured
+ * interval: tuning the wait must not reset the visible attempt count.
+ */
+export const OVERLOAD_POLICY_PREFIX = 'auto-continue:'
+
+/** The complete policy key of a reconnect record. */
+export const OVERLOAD_POLICY_KEY = `${OVERLOAD_POLICY_PREFIX}overload`
+
+/**
+ * Locate the retry chain the current step already recorded, so our attempts continue the
+ * row the user is already looking at instead of opening a second one.
+ *
+ * Both numbers are read from the durable log, not from process memory: a plugin reload in
+ * the middle of a long outage must not restart the count at 1. The scan walks backwards in
+ * one pass and counts **all** of this plugin's records for the step, so the count is right
+ * even when the provider's own records sit above ours.
+ *
+ * @param {object} session - the agent's session.
+ * @param {number} turn - current turn.
+ * @param {number} step - current step.
+ * @returns {{ retryId?: string, baseRetry: number, ours: number }}
+ */
+export function findRetryChain(session, turn, step) {
+  const found = { baseRetry: 0, ours: 0 }
+  if (typeof session?.eventAt !== 'function' || typeof session?.seq !== 'number') return found
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = session.eventAt(seq)
+    if (event === undefined || event === null) continue
+    if (event.type !== 'llm/retry') continue
+    const data = event.data
+    if (data?.turn !== turn || data?.step !== step) continue
+    const policyKey = typeof data.policyKey === 'string' ? data.policyKey : ''
+    if (policyKey.startsWith(OVERLOAD_POLICY_PREFIX)) {
+      found.ours += 1
+      continue
+    }
+    // Newest record from the provider's own policy: it owns the chain and its numbering.
+    if (found.retryId === undefined) {
+      if (typeof data.retryId === 'string' && data.retryId.length > 0) found.retryId = data.retryId
+      found.baseRetry = Number.isInteger(data.retry) && data.retry > 0 ? data.retry : 0
+    }
+  }
+  return found
+}
+
+/**
+ * Record one reconnect as a durable `llm/retry` event, the same record `dsh-llm-retry`
+ * writes for its own attempts.
+ *
+ * This is what keeps the wait honest to the user: the chat renders the chain from these
+ * events (provider, failure, attempt count, countdown), so an unbounded reconnect shows up
+ * as a live "retrying ∞ — 10s" row instead of a turn that looks stuck. Reporting it only to
+ * this plugin's own log file would hide a potentially hours-long wait from the conversation.
+ *
+ * @param {object} payload - the `agent/request-error` payload.
+ * @param {{ retryId: string, retry: number, delayMs: number }} record - what to record.
+ * @param {object} failure - the provider failure being waited out.
+ * @returns {boolean} whether the record was written.
+ */
+export function announceReconnect(payload, record, failure) {
+  const session = payload?.agent?.session
+  if (typeof session?.append !== 'function') return false
+  try {
+    session.append('llm/retry', {
+      retryId: record.retryId,
+      turn: payload.turn,
+      step: payload.step,
+      provider: String(payload.provider ?? 'unknown'),
+      mode: 'always',
+      policyKey: OVERLOAD_POLICY_KEY,
+      retry: record.retry,
+      delayMs: record.delayMs,
+      failure,
+    })
+    return true
+  } catch {
+    // A session that refuses the record must not stop the reconnect itself.
+    return false
+  }
+}
+
+/**
+ * Close one reconnect record once its wait actually completed.
+ * @param {object} payload - the `agent/request-error` payload.
+ * @param {{ retryId: string, retry: number }} record - the record to close.
+ * @returns {void}
+ */
+export function announceReconnectStarted(payload, record) {
+  const session = payload?.agent?.session
+  if (typeof session?.append !== 'function') return
+  try {
+    session.append('llm/retry-started', {
+      retryId: record.retryId,
+      turn: payload.turn,
+      step: payload.step,
+      retry: record.retry,
+    })
+  } catch {
+    /* the wait already happened; a failed announcement changes nothing */
+  }
+}
+
+/**
+ * Answer one `agent/request-error` for the overload reconnector.
+ *
+ * The bounded retry policy (`dsh-llm-retry`, 5 attempts by default) must get every attempt
+ * it is entitled to **before** this listener starts reconnecting without a ceiling.
+ * Registration order cannot be relied on: a profile may mount this plugin above or below
+ * `llm-retry` on the waterfall. So this listener always asks downstream first and passes a
+ * downstream `{ kind: 'retry' }` through untouched; it only takes over once the downstream
+ * chain declines the failure, which is exactly the moment DSH would otherwise render
+ * "本轮运行失败" and close the turn.
+ *
+ * Returning `{ kind: 'retry' }` re-sends the request inside the same step, so the
+ * conversation, the tool results and the user's place in the turn all survive.
+ *
+ * @param {object} payload - the `agent/request-error` payload.
+ * @param {() => Promise<object>} next - the downstream recovery chain.
+ * @param {object} options - resolved config.
+ * @param {Map<string, object>} state - per-provider reconnect bookkeeping.
+ * @param {(record: object) => void} log - decision sink.
+ * @returns {Promise<object>}
+ */
+export async function reconnectOnOverload(payload, next, options, state, log) {
+  if (!options.overloadReconnect) return next()
+
+  const failure = payload?.failure
+  const verdict = classifyOverload(failure, options)
+  if (!verdict.overload) return next()
+
+  // A cancelled turn is the user's decision, not an outage: never hold it open.
+  if (payload?.signal?.aborted === true) {
+    log({ event: 'overload', action: 'delegate', reason: 'turn-aborted' })
+    return next()
+  }
+
+  // Let the provider's own bounded retry spend its budget first. Anything downstream
+  // answers is passed straight back up; only a declined failure reaches the code below.
+  const downstream = await next()
+  if (downstream?.kind === 'retry') return downstream
+
+  const provider = String(payload?.provider ?? 'unknown')
+  const turn = payload?.turn
+  const step = payload?.step
+  // Bookkeeping is per provider **and** per step: a new step means the previous attempt
+  // series ended (probably successfully), so the reconnect budget must start over.
+  const previous = state.get(provider)
+  const entry =
+    previous !== undefined && previous.turn === turn && previous.step === step
+      ? previous
+      : { attempts: 0, since: Date.now(), turn, step }
+  state.set(provider, entry)
+  entry.attempts += 1
+
+  const waitedMs = Date.now() - entry.since
+  if (options.overloadMaxWaitMs > 0 && waitedMs >= options.overloadMaxWaitMs) {
+    log({
+      event: 'overload',
+      action: 'delegate',
+      reason: 'wait-budget-exhausted',
+      provider,
+      attempts: entry.attempts,
+      waitedMs,
+    })
+    return undefined
+  }
+
+  // Continue the chain the conversation already shows: same retry id as the provider's
+  // attempts, numbered after them, so the row keeps counting up instead of restarting.
+  //
+  // The durable log is the authority, but it is only readable when the session exposes
+  // `eventAt`/`seq`. Where it does not, the per-provider entry still knows how many
+  // reconnects this step already made, so the number keeps climbing instead of pinning
+  // at 1 — a display detail, but one the user reads as "is this thing still alive?".
+  const chain = findRetryChain(payload?.agent?.session, turn, step)
+  const record = {
+    retryId: typeof chain.retryId === 'string'
+      ? chain.retryId
+      : `${OVERLOAD_POLICY_PREFIX}${provider}:${String(turn)}:${String(step)}`,
+    retry: chain.baseRetry + Math.max(chain.ours, entry.attempts - 1) + 1,
+    delayMs: options.overloadRetryIntervalMs,
+  }
+  const announced = announceReconnect(payload, record, failure)
+
+  log({
+    event: 'overload',
+    action: 'reconnect',
+    provider,
+    turn: turn ?? null,
+    step: step ?? null,
+    attempt: entry.attempts,
+    retry: record.retry,
+    intervalMs: options.overloadRetryIntervalMs,
+    match: verdict.reason,
+    announced,
+    code: typeof failure?.code === 'string' ? failure.code : null,
+    status: typeof failure?.status === 'number' ? failure.status : null,
+    requestId: typeof failure?.requestId === 'string' ? failure.requestId : null,
+  })
+
+  // `keepAlive: true`: this wait is the whole point — the reconnect must still be pending
+  // when the provider recovers, so it may hold the loop open (a shutdown aborts it anyway).
+  const waited = await sleep(options.overloadRetryIntervalMs, payload?.signal, { keepAlive: true })
+  if (!waited) {
+    log({ event: 'overload', action: 'delegate', reason: 'wait-cancelled', attempts: entry.attempts })
+    // The turn is over; hand the failure back so the loop records its own ending.
+    return undefined
+  }
+  if (announced) announceReconnectStarted(payload, record)
+
+  return { kind: 'retry' }
+}
+
+// ---------------------------------------------------------------------------
 // logging
 // ---------------------------------------------------------------------------
 
@@ -1143,13 +1518,37 @@ export function stateFor(states, agentId, turn, folded) {
 }
 
 /**
+ * Wait for `ms`, giving up as soon as `signal` aborts.
+ *
+ * The abort listener is registered for the whole wait and removed on both exits, so a
+ * reconnector that runs for hours does not leak one listener per attempt onto the turn's
+ * signal.
+ *
+ * `keepAlive` decides whether the timer holds the event loop open. The reconnect wait keeps
+ * it (its only job is to still be waiting when the provider recovers, so letting the process
+ * fall out from under it would be self-defeating); an ordinary in-turn pause does not, so a
+ * shutting-down host is never held up by a plugin's cosmetic delay.
  * @param {number} ms - delay.
- * @returns {Promise<void>}
+ * @param {AbortSignal} [signal] - optional cancellation.
+ * @param {{ keepAlive?: boolean }} [options] - timer ref behaviour.
+ * @returns {Promise<boolean>} false when the wait was cancelled.
  */
-function sleep(ms) {
+function sleep(ms, signal, options = {}) {
+  if (signal?.aborted === true) return Promise.resolve(false)
+  if (!(ms > 0)) return Promise.resolve(true)
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    if (typeof timer?.unref === 'function') timer.unref()
+    let settled = false
+    const finish = (completed) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      signal?.removeEventListener?.('abort', onAbort)
+      resolve(completed)
+    }
+    const onAbort = () => finish(false)
+    const timer = setTimeout(() => finish(true), ms)
+    if (options.keepAlive !== true && typeof timer?.unref === 'function') timer.unref()
+    signal?.addEventListener?.('abort', onAbort, { once: true })
   })
 }
 
@@ -1309,8 +1708,10 @@ async function onTurnStopping(ctx, options, states, payload) {
 /**
  * Install the plugin.
  *
- * With `enabled: false` or `maxNudges: 0` nothing is installed and the plugin is
- * behaviourally identical to not being installed.
+ * `enabled: false` installs nothing at all. `maxNudges: 0` disables the two push layers
+ * (completion protocol and turn-stopping) but **not** the overload reconnector: stopping
+ * the "推它继续" behaviour is a different wish from stopping the "别把这一轮判死" behaviour,
+ * and the latter is what keeps a long task alive through a provider outage.
  * @param {object} ctx - the plugin context.
  * @param {unknown} config - the Loader row's config.
  * @returns {void}
@@ -1323,12 +1724,18 @@ export function apply(ctx, config) {
       message: `ignored ${options.invalidPatterns.length} invalid pattern(s)`,
     })
   }
-  if (!options.enabled || options.maxNudges <= 0) {
-    writePluginLog(options, ctx, {
-      event: 'inert',
-      reason: options.enabled ? 'maxNudges=0' : 'enabled=false',
-    })
+  if (!options.enabled) {
+    writePluginLog(options, ctx, { event: 'inert', reason: 'enabled=false' })
     return
+  }
+
+  const nudging = options.maxNudges > 0
+  if (!nudging && !options.overloadReconnect) {
+    writePluginLog(options, ctx, { event: 'inert', reason: 'maxNudges=0 and overloadReconnect=false' })
+    return
+  }
+  if (!nudging) {
+    writePluginLog(options, ctx, { event: 'inert', reason: 'maxNudges=0: nudge layers off' })
   }
 
   /** @type {Map<string, { turn: number, count: number, fingerprints: Set<string> }>} */
@@ -1337,12 +1744,14 @@ export function apply(ctx, config) {
   const guardBudgets = new Map()
   /** @type {Map<string, number>} */
   const guardRetries = new Map()
+  /** @type {Map<string, { attempts: number, since: number }>} */
+  const overloadState = new Map()
 
   // ---- completion protocol: our own system-prompt section -------------------
   // The service key is `systemPrompt` (camelCase); `system-prompt` is the event name.
   // The returned disposer MUST be registered: without it every reload appends another
   // section to live sessions.
-  if (options.completionProtocol) {
+  if (nudging && options.completionProtocol) {
     try {
       const systemPrompt = ctx.get('systemPrompt')
       if (systemPrompt === undefined) {
@@ -1383,11 +1792,13 @@ export function apply(ctx, config) {
         states.clear()
         guardBudgets.clear()
         guardRetries.clear()
+        overloadState.clear()
         return
       }
       const key = String(agentId)
       states.delete(key)
       guardBudgets.delete(key)
+      overloadState.delete(key)
       const prefix = `${key}|`
       for (const retryKey of guardRetries.keys()) {
         if (retryKey.startsWith(prefix)) guardRetries.delete(retryKey)
@@ -1397,21 +1808,23 @@ export function apply(ctx, config) {
     }
   })
 
-  ctx.on('agent/turn-stopping', async (payload) => {
-    try {
-      await onTurnStopping(ctx, options, states, payload)
-    } catch (error) {
+  if (nudging) {
+    ctx.on('agent/turn-stopping', async (payload) => {
       try {
-        writePluginLog(options, ctx, {
-          event: 'error',
-          message: error instanceof Error ? error.message : String(error),
-          turn: payload?.turn ?? null,
-        })
-      } catch {
-        /* the innermost failure path still must not throw */
+        await onTurnStopping(ctx, options, states, payload)
+      } catch (error) {
+        try {
+          writePluginLog(options, ctx, {
+            event: 'error',
+            message: error instanceof Error ? error.message : String(error),
+            turn: payload?.turn ?? null,
+          })
+        } catch {
+          /* the innermost failure path still must not throw */
+        }
       }
-    }
-  })
+    })
+  }
 
   // ---- provider-side guard --------------------------------------------------
   if (options.streamGuard) {
@@ -1495,9 +1908,47 @@ export function apply(ctx, config) {
     })
   }
 
+  // ---- overload reconnector -------------------------------------------------
+  // Relative to `dsh-llm-retry` this listener is order-independent, because
+  // `reconnectOnOverload` always asks downstream first and passes a downstream
+  // `{ kind: 'retry' }` through untouched: whichever of the two is outer, the provider's
+  // bounded budget is spent before the unbounded reconnector takes over. The only moment
+  // this layer acts is the one where the whole chain declined — i.e. where the loop would
+  // otherwise throw and close the turn as failed.
+  if (options.overloadReconnect) {
+    const logOverload = (record) => {
+      try {
+        writePluginLog(options, ctx, record)
+      } catch {
+        /* diagnostics must never affect recovery */
+      }
+    }
+
+    ctx.on('agent/request-error', async (payload, next) => {
+      try {
+        return await reconnectOnOverload(payload, next, options, overloadState, logOverload)
+      } catch (error) {
+        try {
+          logOverload({
+            event: 'error',
+            message: error instanceof Error ? error.message : String(error),
+            stage: 'overload-reconnect',
+          })
+        } catch {
+          /* never let reconnect logging break recovery */
+        }
+        // Deliberately NOT `next()`: a waterfall `next` is single-shot, and the failure may
+        // already have been delegated inside `reconnectOnOverload`. Declining here leaves
+        // the loop to record its own ending, which is the pre-plugin behaviour.
+        return undefined
+      }
+    })
+  }
+
   ctx.effect(() => () => {
     states.clear()
     guardBudgets.clear()
     guardRetries.clear()
+    overloadState.clear()
   })
 }
