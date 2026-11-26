@@ -2,5 +2,5 @@ url: https://github.com/VergilYe/dsh-auto-continue
 name: VergilYe/dsh-auto-continue
 category: session
 description:
-  en: 'Keeps a turn alive instead of closing it early: a stream guard turns silent truncation into an in-step retry, a completion protocol asks the model to declare how each turn ended, and once the provider''s own retries are spent on a 429/529 overload it reconnects every 10 seconds with no ceiling instead of failing the turn.'
-  zh: '避免轮次过早关闭：把静默截断的流转成同一步内可重试的失败，要求模型在每轮结束时声明收尾方式；遇到 429/529（含 GLM 1305「访问量过大」）在既有重试耗尽后每 10 秒无限重连，不再提示本轮运行失败。'
+  en: 'Keeps a turn from ending too early: a provider overload (429/529 overloaded_error, GLM code 1305) is retried every 10 seconds with no attempt ceiling instead of failing the turn, a silently truncated reply becomes an in-step retry, and the model must declare with a done/ask block how each turn ended so a plan-only reply cannot close it.'
+  zh: '让轮次不提前结束：上游过载（429/529 overloaded_error、GLM 错误码 1305）在 DSH 自带重试耗尽后每 10 秒无限重连而不是判死这一轮；静默截断的回复自动在同步内重发；模型必须用 done/ask 块声明收尾方式，只写计划的回复关不掉这一轮。'
