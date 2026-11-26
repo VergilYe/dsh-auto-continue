@@ -11,23 +11,54 @@ https://cdn.jsdelivr.net/npm/dsh-plugin-catalog/index.json
 Being listed there is what makes the plugin discoverable — no SDK, no review of
 binaries, just one YAML entry in that repository.
 
+## Three places show text, and they are not the same file
+
+This is the part that trips people up: changing the description in this repository
+does **not** change the market card.
+
+| Where the text appears | What actually feeds it | Where to change it |
+|---|---|---|
+| Market card in Discover | `data/plugins/VergilYe__dsh-auto-continue.yml` **in the catalog repo** | PR to `awesome-dsh-plugin/awesome-dsh-plugin` |
+| Plugin detail page — title & one-line summary | `locale/*.json` → `meta.description` in **this** repo | here, then `npm publish` |
+| Plugin detail page — long description | `meta.detail` file, or the **README** when none is declared | `README.md` here, then `npm publish` |
+
+`market/VergilYe__dsh-auto-continue.yml` in this repo is a **staging copy** of the
+catalog entry. Nothing reads it; it exists so the submission is reviewable and
+versioned next to the code. Updating it has no runtime effect.
+
+DSH has no separate “release notes” / changelog concept for plugins: the detail page
+is `meta.description` plus a document (or README). So “update notes” means updating
+those, and bumping the version so the installed copy picks them up.
+
+### The detail page reads the installed package
+
+The detail page for an installed bundle reads that bundle's own files, not npm and not
+GitHub. With a `link:` install it tracks the working tree immediately; with a registry
+install you must publish a new version and upgrade for the text to change.
+
 ## The submission
 
-One file: `data/plugins/VergilYe__dsh-auto-continue.yml`
+One file: `data/plugins/VergilYe__dsh-auto-continue.yml` (in the **catalog** repo).
+
+Current content — capability-first, per `contributing.md` (`description.en` must be a
+single line ending with a period):
 
 ```yaml
 url: https://github.com/VergilYe/dsh-auto-continue
 name: VergilYe/dsh-auto-continue
 category: session
 description:
-  en: 'Keeps a turn from closing on an unfinished reply: a stream guard turns silent truncation into an in-step retry, and a completion protocol asks the model to declare how each turn ended.'
-  zh: '避免轮次停在「话没说完」或「只写了下一步计划」上关闭：把静默截断的流转成同一步内可重试的失败，并要求模型在每轮结束时声明收尾方式。'
+  en: 'Retries provider overload (429/529 overloaded_error, GLM code 1305) every 10 seconds with no attempt ceiling after DSH''s own retries run out, instead of failing the turn; turns a silently truncated reply into an in-step retry; and requires a done/ask block so a plan-only reply cannot close the turn.'
+  zh: '上游过载（429/529 overloaded_error、GLM 错误码 1305）在 DSH 自带重试耗尽后每 10 秒无限重连，不判死这一轮；静默截断的回复在同一请求步内自动重发；并要求 done/ask 收尾声明，让只写计划的回复关不掉这一轮。'
 ```
 
 - The filename is `<owner>__<repo>.yml`.
 - `category: session` — the plugin acts on turn lifecycle. (`workflow` would also be
   defensible; maintainers re-file without bouncing the PR.)
-- The description contains `: `, so it **must** be quoted.
+- The description contains `: `, so it **must** be quoted. A single quote inside an
+  English string is escaped by doubling it (`DSH''s`).
+- CI checks: `description.en` present, non-empty, **one line**, ends with a period.
+  No length cap is enforced, but the card truncates — lead with the capability.
 
 ## Requirements, checked by CI
 
