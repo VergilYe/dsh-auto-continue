@@ -1,10 +1,10 @@
 {
   "name": "@vergilye/dsh-auto-continue",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Keeps a DeepSeek Harness turn from closing on an unfinished reply, and keeps it alive through provider overload: a llm/stream guard turns silent truncation into a retry, a completion protocol asks the model to declare how the turn ended, and after the provider's own retries are spent on a 429/529 overload it reconnects every 10 seconds with no ceiling instead of failing the turn",
+  "description": "Keeps a turn from ending too early: retries provider overload (429/529 overloaded_error, including GLM error code 1305) every 10 seconds with no attempt ceiling instead of failing the turn, turns a silently truncated reply into an in-step retry, and requires a done/ask block so a plan-only reply cannot close the turn.",
   "type": "module",
   "main": "index.js",
   "exports": {
