@@ -30,7 +30,9 @@ import {
 const ROUTE = 'open-design/deepseek-v4.1-flash';
 const FENCE = '`'.repeat(3);
 const DONE_OPEN = `${FENCE}done`;
+const ASK_OPEN = `${FENCE}ask`;
 const doneBlock = (summary) => `${DONE_OPEN}\n✅ 已完成：${summary}\n${FENCE}`;
+const askBlock = (question) => `${ASK_OPEN}\n❓ 待确认：${question}\n${FENCE}`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function tmpLog() {
@@ -650,6 +652,55 @@ const OVERLOAD_529 = {
   message:
     '529 {"type":"error","error":{"type":"overloaded_error","code":"1305","message":"[1305][该模型当前访问量过大，请您稍后再试][2026112411431495ba06cef0884121]"},"request_id":"2026112411431495ba06cef0884121"}',
 };
+
+test('listener: an ask block followed by a closing sentence does not reopen the turn', async () => {
+  // Regression for a real misfire (session-0bb08e46 turn 126): the model asked three
+  // questions, then added one polite summary line. The listener pushed, and because the
+  // nudge is a user-role message the model read it as the human saying "go ahead" and
+  // started implementing guesses instead of waiting for the answers.
+  const log = tmpLog();
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: log.file, logDecisions: true });
+  const steers = [];
+  const askThenSummary = [
+    '关键事实出来了：模板里本来就有「备注」。',
+    '',
+    askBlock('问题2：嵌入图片 openpyxl 读不到。这样可行吗？'),
+    '',
+    '三个问题确认后我一次性改完，避免返工。',
+  ].join('\n');
+  const agent = makeAgent(windowSession({ text: askThenSummary }), { steers });
+
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  assert.equal(steers.length, 0, 'a question must never be answered by the machine on the user\'s behalf');
+
+  const decision = readLines(log.file).find((line) => line.event === 'decision');
+  assert.equal(decision.reason, 'protocol-ask');
+});
+
+test('listener: a bare question with no declaration is still not pushed', async () => {
+  // The ask-block case above is the exact shape that misfired. This guards the wider
+  // intent: when the model is asking the human something, auto-continue stays out of it.
+  const { ctx, handlers } = makeCtx();
+  apply(ctx, { logFile: tmpLog().file });
+  const steers = [];
+  const agent = makeAgent(
+    windowSession({ text: `${askBlock('问题1：前后块是否不出现这三列？')}\n确认后我一次性改完。` }),
+    { steers },
+  );
+  await fire(handlers, 'agent/turn-stopping', { agent, turn: 1, signal: { aborted: false } });
+  assert.equal(steers.length, 0);
+});
+
+test('listener: the nudge text tells the model it is not the user speaking', () => {
+  const options = resolveConfig({});
+  assert.match(options.protocolNudgeText, /自动续跑插件/, 'the nudge must identify itself');
+  assert.match(
+    options.protocolNudgeText,
+    /不是用户本人的许可|不要把它当成/,
+    'and must say it is not the human granting permission',
+  );
+});
 
 test('overload: config defaults deliver 10s, unbounded, on', () => {
   const options = resolveConfig({});

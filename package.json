@@ -1,6 +1,6 @@
 {
   "name": "@vergilye/dsh-auto-continue",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "publishConfig": {
     "access": "public"
   },

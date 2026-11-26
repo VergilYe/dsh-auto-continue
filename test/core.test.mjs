@@ -125,10 +125,54 @@ test('parse: a declaration that is not the last thing is not a declaration', () 
   // A second, ordinary code block after the declaration: also not the last thing.
   const trailingCode = ['改好了。', doneBlock('修好 3 个 bug'), '', '```js', 'const a = 1', '```'].join('\n');
   assert.equal(parseProtocol(trailingCode, options).verdict, 'missing');
+});
 
-  // Prose after an ask block has the same problem.
-  const askThenMore = ['还没定。', askBlock('同步 V2.4 吗'), '', '我先按不同步准备。'].join('\n');
-  assert.equal(parseProtocol(askThenMore, options).verdict, 'missing');
+test('parse: an ask block keeps closing after a closing sentence', () => {
+  // Regression for a real misfire: the model wrote three ask blocks, then one polite
+  // summary line ("三个问题确认后我一次性改完"). The structural rule read that as
+  // undeclared, the listener pushed, the nudge arrived as a user-role message, and the
+  // model — reading it as the human's permission — started implementing instead of
+  // waiting for the answers it had just asked for.
+  const options = resolveConfig({});
+  const askThenSummary = [
+    '关键事实出来了：模板里本来就有「备注」。',
+    '',
+    askBlock('嵌入图片 openpyxl 读不到。这样可行吗？'),
+    '',
+    '三个问题确认后我一次性改完，避免返工。',
+  ].join('\n');
+  assert.equal(parseProtocol(askThenSummary, options).verdict, 'ask');
+
+  // Several ask blocks in one reply, prose after them: still closing.
+  const manyAsks = [
+    '三个问题要确认：',
+    askBlock('问题1：前后块是否不出现这三列？'),
+    askBlock('问题2：嵌入图提示是否可行？'),
+    '确认后我一次性改完。',
+  ].join('\n');
+  assert.equal(parseProtocol(manyAsks, options).verdict, 'ask');
+
+  // Even a trailing code block does not turn a question into "keep going".
+  const askThenCode = ['问一下。', askBlock('要同步 V2.4 吗'), '', '```py', 'x = 1', '```'].join('\n');
+  assert.equal(parseProtocol(askThenCode, options).verdict, 'ask');
+});
+
+test('parse: an empty ask block is still malformed, prose or not', () => {
+  const options = resolveConfig({});
+  const emptyAsk = ['我提个问题。', `${ASK_OPEN}`, '', CLOSE, '', '等你回答。'].join('\n');
+  assert.equal(parseProtocol(emptyAsk, options).verdict, 'empty');
+});
+
+test('parse: done keeps the strict rule, ask can be loosened only by config', () => {
+  const strict = resolveConfig({ askClosesDespiteTrailingProse: false });
+  const askThenProse = ['问一下。', askBlock('要同步 V2.4 吗'), '', '我先按不同步准备。'].join('\n');
+  assert.equal(
+    parseProtocol(askThenProse, strict).verdict,
+    'missing',
+    'with the escape hatch off, ask is held to the same structural rule as done',
+  );
+  const doneThenProse = ['改好了。', doneBlock('修好 3 个 bug'), '', '顺便说一句。'].join('\n');
+  assert.equal(parseProtocol(doneThenProse, resolveConfig({})).verdict, 'missing');
 });
 
 test('parse: trailing syntax noise after the block also fails the last-thing test', () => {

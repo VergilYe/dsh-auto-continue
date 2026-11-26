@@ -215,6 +215,7 @@ export const DEFAULTS = Object.freeze({
   maxGuardRetries: 1,
   completionProtocol: true,
   markerStyle: 'fence-check',
+  askClosesDespiteTrailingProse: true,
   overloadReconnect: true,
   overloadRetryIntervalMs: 10_000,
   overloadMaxWaitMs: 0,
@@ -222,7 +223,8 @@ export const DEFAULTS = Object.freeze({
   overloadPatterns: [...DEFAULT_OVERLOAD_PATTERNS],
 
   protocolNudgeText:
-    '继续。若还有没做完的事就直接做完；完成时用 done 代码块收尾，需要我拍板时用 ask 代码块。',
+    '（自动续跑插件）你的上一条回复缺少 done/ask 收尾声明。若还有没做完的事就直接做完；'
+    + '若你在等用户拍板，用 ask 代码块写明问题并停下——这条消息不是用户本人的许可，不要把它当成"继续"的授权。',
   giveUpNoticeText:
     '（自动续接已停止：本轮多次推送都没有收到收尾声明。可能是上游断连或配额问题，请检查后手动继续。）',
   nudgeText: DEFAULT_NUDGE_TEXT,
@@ -330,6 +332,10 @@ export function resolveConfig(raw) {
       ? input.maxGuardRetries
       : DEFAULTS.maxGuardRetries,
     completionProtocol: bool(input.completionProtocol, DEFAULTS.completionProtocol),
+    askClosesDespiteTrailingProse: bool(
+      input.askClosesDespiteTrailingProse,
+      DEFAULTS.askClosesDespiteTrailingProse,
+    ),
     ...markers,
     protocolNudgeText: text(input.protocolNudgeText, DEFAULTS.protocolNudgeText),
     giveUpNoticeText: text(input.giveUpNoticeText, DEFAULTS.giveUpNoticeText),
@@ -812,6 +818,9 @@ export function parseProtocol(text, options) {
  * non-blank line must close a fenced block, and that block must be the declaration block.
  * Only that shape counts as a finished reply — trailing prose, a second block, or a
  * declaration that sits mid-text all mean the turn is not settled.
+ *
+ * This applies to `done` only. See {@link askSurvivesTrailingProse} for why an `ask` block
+ * is held to a different bar.
  * @param {string} body - final body.
  * @param {object} options - resolved config.
  * @returns {boolean}
@@ -836,6 +845,30 @@ function declarationIsLastBlock(body, options) {
     return trimmed.startsWith(options.doneMarker) || trimmed.startsWith(options.askMarker)
   }
   return false
+}
+
+/**
+ * Whether an `ask` declaration still counts when prose follows the block.
+ *
+ * `done` keeps the strict structural rule: talking on after `done` is usually a retraction
+ * ("等等，我还没做完"), and pushing is the safe direction — the worst case is one extra
+ * nudge that the model answers by repeating itself.
+ *
+ * `ask` is the opposite. A question is worth pushing past only if the model could answer
+ * it itself, and writing the question is precisely how it says it cannot. Prose after an
+ * ask block is a polite closing sentence ("三个问题确认后我一次性改完，避免返工。"), not a
+ * retraction — and treating it as one makes the listener send "继续。若还有没做完的事就
+ * 直接做完", which arrives as a **user-role** message. The model then reads a machine
+ * nudge as the human's permission and proceeds on a guess, which is exactly the outcome
+ * the question existed to prevent.
+ *
+ * So an ask block that carries a real question closes the turn wherever it sits. An ask
+ * block whose body is empty stays "empty" (malformed) and is still pushed.
+ * @param {object} options - resolved config.
+ * @returns {boolean}
+ */
+export function askSurvivesTrailingProse(options) {
+  return options.askClosesDespiteTrailingProse !== false
 }
 
 /**
@@ -870,12 +903,19 @@ function parseFencedProtocol(body, options) {
     collected.push(lines[j])
   }
   const summary = collected.join('\n').trim()
+  if (summary.length === 0) return { verdict: 'empty', summary }
+  // An `ask` block is the model declining to proceed on its own; trailing prose is a
+  // closing sentence, not a retraction (see `askSurvivesTrailingProse`). A `done` block
+  // keeps the strict structural rule: talking on after it means the work is not finished.
+  if (kind === 'ask' && askSurvivesTrailingProse(options)) {
+    return { verdict: 'ask', summary }
+  }
   // A declaration that is not the final block does not close the turn: the model went on
   // talking after it, so treat it as undeclared and let the listener push once.
   if (!declarationIsLastBlock(body, options)) {
-    return { verdict: summary.length > 0 ? 'missing' : 'empty', summary }
+    return { verdict: 'missing', summary }
   }
-  return { verdict: summary.length > 0 ? kind : 'empty', summary }
+  return { verdict: kind, summary }
 }
 
 /**

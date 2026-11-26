@@ -28,6 +28,10 @@
         dryRun: false
         completionProtocol: true
         markerStyle: fence-check
+        # An `ask` block still closes the turn when a closing sentence follows it. `done`
+        # keeps the strict "must be the last thing" rule. Set to false for the old
+        # behaviour, where a trailing sentence made the question read as undeclared.
+        askClosesDespiteTrailingProse: true
         streamGuard: true
         streamIdleMs: 90000
         maxGuardRetries: 1
